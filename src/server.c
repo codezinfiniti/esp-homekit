@@ -13,10 +13,12 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #elif defined(ESP_OPEN_RTOS)
 #include <FreeRTOS.h>
 #include <task.h>
 #include <queue.h>
+#include <semphr.h>
 #else
 #error "Unknown target platform"
 #endif
@@ -28,6 +30,7 @@
 
 #include "constants.h"
 #include "base64.h"
+#include "bitset.h"
 #include "crypto.h"
 #include "pairing.h"
 #include "storage.h"
@@ -39,6 +42,7 @@
 #include <homekit/homekit.h>
 #include <homekit/characteristics.h>
 #include <homekit/tlv.h>
+#include "tlv_internal.h"
 
 
 #define PORT 5556
@@ -56,6 +60,9 @@ typedef struct _client_context_t client_context_t;
       (server)->config->on_event(event);
 
 
+#define countof(items) (sizeof(items) / sizeof(items[0]))
+
+
 typedef enum {
     HOMEKIT_ENDPOINT_UNKNOWN = 0,
     HOMEKIT_ENDPOINT_PAIR_SETUP,
@@ -67,6 +74,14 @@ typedef enum {
     HOMEKIT_ENDPOINT_PAIRINGS,
     HOMEKIT_ENDPOINT_RESOURCE,
 } homekit_endpoint_t;
+
+
+typedef enum {
+    characteristic_format_type   = (1 << 1),
+    characteristic_format_meta   = (1 << 2),
+    characteristic_format_perms  = (1 << 3),
+    characteristic_format_events = (1 << 4),
+} characteristic_format_t;
 
 
 typedef struct {
@@ -91,6 +106,32 @@ typedef struct {
 
 
 typedef struct {
+    homekit_accessory_t *accessory;
+    uint16_t aid;
+} accessory_info_t;
+
+
+typedef struct {
+    homekit_service_t *service;
+    uint16_t iid;
+} service_info_t;
+
+
+typedef struct {
+    homekit_characteristic_t *ch;
+    uint16_t aid;
+    uint16_t iid;
+    uint16_t notification_id;
+} characteristic_info_t;
+
+
+typedef struct {
+    homekit_characteristic_t *ch;
+    homekit_value_t value;
+} characteristic_notification_info_t;
+
+
+typedef struct {
     char accessory_id[ACCESSORY_ID_SIZE + 1];
     ed25519_key accessory_key;
 
@@ -103,32 +144,65 @@ typedef struct {
     fd_set fds;
     int max_fd;
 
+    homekit_endpoint_t endpoint;
+    struct {
+        struct {
+            uint16_t aid;
+            uint16_t iid;
+        } ids[25];
+        characteristic_format_t format;
+    } endpoint_params;
+
+    byte data[1024 + 18];
+    byte output_buffer[1024];
+
+    char *body;
+    size_t body_length;
+    bool body_static;
+    http_parser parser;
+
+    bool request_completed;
+
+    json_stream json;
+    tlv_stream_t tlv_stream;
+
+    SemaphoreHandle_t notification_lock;
+
+    uint16_t accessory_count;
+    accessory_info_t *accessory_infos;
+
+    uint16_t service_count;
+    service_info_t *service_infos;
+
+    uint16_t characteristic_count;
+    characteristic_info_t *characteristic_infos;
+
+    uint16_t notify_count;
+    characteristic_notification_info_t *notifications;
+
+    bitset_t *subscriptions;
+    bool has_notifications;
+    bitset_t *has_notification;
+
     int client_count;
     client_context_t *clients;
+    bitset_t *client_ids;
 } homekit_server_t;
+
+
+static homekit_server_t *server = NULL;
 
 
 struct _client_context_t {
     homekit_server_t *server;
+
+    uint8_t id;
     int socket;
-    homekit_endpoint_t endpoint;
-    query_param_t *endpoint_params;
-
-    byte data[1024 + 18];
-    size_t data_size;
-    size_t data_available;
-
-    char *body;
-    size_t body_length;
-    http_parser parser;
 
     int pairing_id;
     byte permissions;
 
     bool disconnect;
-
-    homekit_characteristic_t *current_characteristic;
-    homekit_value_t *current_value;
 
     bool encrypted;
     byte read_key[32];
@@ -136,25 +210,23 @@ struct _client_context_t {
     int count_reads;
     int count_writes;
 
-    QueueHandle_t event_queue;
     pair_verify_context_t *verify_context;
 
     struct _client_context_t *next;
 };
 
 
-typedef struct {
-    homekit_characteristic_t *characteristic;
-    homekit_value_t value;
-} characteristic_event_t;
-
-
 void client_context_free(client_context_t *c);
 void pairing_context_free(pairing_context_t *context);
+void client_send_chunk(byte *data, size_t size, void *arg);
 
 
 homekit_server_t *server_new() {
     homekit_server_t *server = malloc(sizeof(homekit_server_t));
+    if (!server) {
+        return NULL;
+    }
+
     FD_ZERO(&server->fds);
     server->max_fd = 0;
     server->client_count = 0;
@@ -162,11 +234,84 @@ homekit_server_t *server_new() {
     server->paired = false;
     server->pairing_context = NULL;
     server->clients = NULL;
+
+    memset(&server->endpoint_params, 0, sizeof(server->endpoint_params));
+
+    server->body = NULL;
+    server->body_length = 0;
+    server->body_static = false;
+    http_parser_init(&server->parser, HTTP_REQUEST);
+
+    json_init(&server->json, server->output_buffer, sizeof(server->output_buffer),
+              client_send_chunk, NULL);
+    tlv_stream_init(
+        &server->tlv_stream,
+        server->output_buffer, sizeof(server->output_buffer), client_send_chunk, NULL
+    );
+
+    server->accessory_count = 0;
+    server->accessory_infos = NULL;
+    server->service_count = 0;
+    server->service_infos = NULL;
+    server->characteristic_count = 0;
+    server->characteristic_infos = NULL;
+
+    server->client_ids = bitset_new(HOMEKIT_MAX_CLIENTS);
+
+    server->notification_lock = xSemaphoreCreateBinary();
+    if (!server->notification_lock) {
+        bitset_free(server->client_ids);
+        free(server);
+        return NULL;
+    }
+
+    xSemaphoreGive(server->notification_lock);
+
+    server->has_notifications = false;
+    server->subscriptions = NULL;
+    server->notifications = NULL;
+    server->has_notification = NULL;
+
     return server;
 }
 
 
 void server_free(homekit_server_t *server) {
+    if (server->client_ids) {
+        bitset_free(server->client_ids);
+    }
+
+    if (server->has_notification) {
+        bitset_free(server->has_notification);
+    }
+
+    if (server->notifications) {
+        free(server->notifications);
+    }
+
+    if (server->subscriptions) {
+        bitset_free(server->subscriptions);
+    }
+
+    if (server->notification_lock) {
+        vSemaphoreDelete(server->notification_lock);
+    }
+
+    if (server->characteristic_infos) {
+        free(server->characteristic_infos);
+    }
+
+    if (server->service_infos) {
+        free(server->service_infos);
+    }
+
+    if (server->accessory_infos) {
+        free(server->accessory_infos);
+    }
+
+    if (server->body)
+        free(server->body);
+
     if (server->pairing_context)
         pairing_context_free(server->pairing_context);
 
@@ -188,9 +333,9 @@ void server_free(homekit_server_t *server) {
 #define TLV_DEBUG(values)
 #endif
 
-#define CLIENT_DEBUG(client, message, ...) DEBUG("[Client %d] " message, client->socket, ##__VA_ARGS__)
-#define CLIENT_INFO(client, message, ...) INFO("[Client %d] " message, client->socket, ##__VA_ARGS__)
-#define CLIENT_ERROR(client, message, ...) ERROR("[Client %d] " message, client->socket, ##__VA_ARGS__)
+#define CLIENT_DEBUG(client, message, ...) DEBUG("[Client%2d] " message, client->id+1, ##__VA_ARGS__)
+#define CLIENT_INFO(client, message, ...) INFO("[Client%2d] " message, client->id+1, ##__VA_ARGS__)
+#define CLIENT_ERROR(client, message, ...) ERROR("[Client%2d] " message, client->id+1, ##__VA_ARGS__)
 
 void tlv_debug(const tlv_values_t *values) {
     DEBUG("Got following TLV values:");
@@ -260,7 +405,7 @@ typedef enum {
     HAPStatus_NoAccessoryConnection = -70402,
     // Resource is busy, try again
     HAPStatus_ResourceBusy = -70403,
-    // Connot write to read only characteristic
+    // Cannot write to read only characteristic
     HAPStatus_ReadOnly = -70404,
     // Cannot read from a write only characteristic
     HAPStatus_WriteOnly = -70405,
@@ -281,6 +426,9 @@ typedef enum {
 
 pair_verify_context_t *pair_verify_context_new() {
     pair_verify_context_t *context = malloc(sizeof(pair_verify_context_t));
+    if (!context) {
+        return NULL;
+    }
 
     context->secret = NULL;
     context->secret_size = 0;
@@ -314,16 +462,12 @@ void pair_verify_context_free(pair_verify_context_t *context) {
 
 client_context_t *client_context_new() {
     client_context_t *c = malloc(sizeof(client_context_t));
+    if (!c) {
+        return NULL;
+    }
+
     c->server = NULL;
-    c->endpoint_params = NULL;
-
-    c->data_size = sizeof(c->data);
-    c->data_available = 0;
-
-    c->body = NULL;
-    c->body_length = 0;
-    http_parser_init(&c->parser, HTTP_REQUEST);
-    c->parser.data = c;
+    c->id = 0;
 
     c->pairing_id = -1;
     c->encrypted = false;
@@ -331,10 +475,7 @@ client_context_t *client_context_new() {
     c->count_writes = 0;
 
     c->disconnect = false;
-
-    c->event_queue = xQueueCreate(20, sizeof(characteristic_event_t*));
     c->verify_context = NULL;
-
     c->next = NULL;
 
     return c;
@@ -345,15 +486,6 @@ void client_context_free(client_context_t *c) {
     if (c->verify_context)
         pair_verify_context_free(c->verify_context);
 
-    if (c->event_queue)
-        vQueueDelete(c->event_queue);
-
-    if (c->endpoint_params)
-        query_params_free(c->endpoint_params);
-
-    if (c->body)
-        free(c->body);
-
     free(c);
 }
 
@@ -362,6 +494,10 @@ void client_context_free(client_context_t *c) {
 
 pairing_context_t *pairing_context_new() {
     pairing_context_t *context = malloc(sizeof(pairing_context_t));
+    if (!context) {
+        return NULL;
+    }
+
     context->srp = crypto_srp_new();
     context->client = NULL;
     context->public_key = NULL;
@@ -379,21 +515,161 @@ void pairing_context_free(pairing_context_t *context) {
     free(context);
 }
 
+accessory_info_t *find_accessory_info(const homekit_server_t *server, const homekit_accessory_t *accessory) {
+    uint16_t l = 0, r = server->accessory_count;
+    while (l < r) {
+        uint16_t m = l + (r - l) / 2;
+        if (server->accessory_infos[m].accessory == accessory) {
+            l = m;
+            break;
+        }
 
-void client_notify_characteristic(homekit_characteristic_t *ch, homekit_value_t value, void *client);
+        if (server->accessory_infos[m].accessory < accessory) {
+            l = m + 1;
+        } else {
+            r = m;
+        }
+    }
+    if (l >= server->accessory_count)
+        return NULL;
+
+    return &server->accessory_infos[l];
+}
+
+service_info_t *find_service_info(const homekit_server_t *server, const homekit_service_t *service) {
+    uint16_t l = 0, r = server->service_count;
+    while (l < r) {
+        uint16_t m = l + (r - l) / 2;
+        if (server->service_infos[m].service == service) {
+            l = m;
+            break;
+        }
+
+        if (server->service_infos[m].service < service) {
+            l = m + 1;
+        } else {
+            r = m;
+        }
+    }
+    if (l >= server->service_count)
+        return NULL;
+
+    return &server->service_infos[l];
+}
+
+characteristic_info_t *find_characteristic_info_by_characteristic(
+    const homekit_server_t *server, const homekit_characteristic_t *ch
+) {
+    uint16_t l = 0, r = server->characteristic_count;
+    while (l < r) {
+        uint16_t m = l + (r - l) / 2;
+        if (server->characteristic_infos[m].ch == ch) {
+            l = m;
+            break;
+        }
+
+        if (server->characteristic_infos[m].ch < ch) {
+            l = m + 1;
+        } else {
+            r = m;
+        }
+    }
+    if (l >= server->characteristic_count)
+        return NULL;
+
+    return &server->characteristic_infos[l];
+}
 
 
-typedef enum {
-    characteristic_format_type   = (1 << 1),
-    characteristic_format_meta   = (1 << 2),
-    characteristic_format_perms  = (1 << 3),
-    characteristic_format_events = (1 << 4),
-} characteristic_format_t;
+// TODO: deprecate accessories argument
+homekit_accessory_t *homekit_accessory_by_id(homekit_accessory_t **accessories, int aid) {
+    for (uint16_t i=0; i < server->accessory_count; i++) {
+        if (server->accessory_infos[i].aid == aid)
+            return server->accessory_infos[i].accessory;
+    }
+    return NULL;
+}
+
+homekit_service_t *homekit_service_by_type(homekit_accessory_t *accessory, const char *type) {
+    for (homekit_service_t **service_it = accessory->services; *service_it; service_it++) {
+        homekit_service_t *service = *service_it;
+
+        if (!strcmp(service->type, type))
+            return service;
+    }
+
+    return NULL;
+}
+
+homekit_characteristic_t *homekit_service_characteristic_by_type(homekit_service_t *service, const char *type) {
+    for (homekit_characteristic_t **ch_it = service->characteristics; *ch_it; ch_it++) {
+        homekit_characteristic_t *ch = *ch_it;
+
+        if (!strcmp(ch->type, type))
+            return ch;
+    }
+
+    return NULL;
+}
+
+// TODO: deprecate accessories argument
+homekit_characteristic_t *homekit_characteristic_by_aid_and_iid(homekit_accessory_t **accessories, int aid, int iid) {
+    for (uint16_t i=0; i < server->characteristic_count; i++) {
+        characteristic_info_t *ch_info = &server->characteristic_infos[i];
+        if (ch_info->aid == aid && ch_info->iid == iid)
+            return ch_info->ch;
+    }
+
+    return NULL;
+}
 
 
-void write_characteristic_json(json_stream *json, client_context_t *client, const homekit_characteristic_t *ch, characteristic_format_t format, const homekit_value_t *value) {
-    json_string(json, "aid"); json_uint32(json, ch->service->accessory->id);
-    json_string(json, "iid"); json_uint32(json, ch->id);
+homekit_characteristic_t *homekit_characteristic_find_by_type(homekit_accessory_t **accessories, int aid, const char *type) {
+    for (uint16_t i=0; i < server->characteristic_count; i++) {
+        characteristic_info_t *ch_info = &server->characteristic_infos[i];
+        if (ch_info->aid == aid && !strcmp(ch_info->ch->type, type))
+            return ch_info->ch;
+    }
+
+    return NULL;
+}
+
+
+bool client_has_subscribed_to_characteristic_events(client_context_t *client, const homekit_characteristic_t *ch) {
+    homekit_server_t *server = client->server;
+
+    characteristic_info_t *info = find_characteristic_info_by_characteristic(server, ch);
+    if (!info)
+        return false;
+
+    return bitset_isset(server->subscriptions, info->notification_id * HOMEKIT_MAX_CLIENTS + client->id);
+}
+
+void client_subscribe_to_characteristic_events(client_context_t *client, const homekit_characteristic_t *ch) {
+    characteristic_info_t *info = find_characteristic_info_by_characteristic(server, ch);
+    if (!info)
+        return;
+
+    bitset_set(client->server->subscriptions, info->notification_id * HOMEKIT_MAX_CLIENTS + client->id);
+}
+
+void client_unsubscribe_from_characteristic_events(client_context_t *client, const homekit_characteristic_t *ch) {
+    characteristic_info_t *info = find_characteristic_info_by_characteristic(server, ch);
+    if (!info)
+        return;
+
+    bitset_clear(client->server->subscriptions, info->notification_id * HOMEKIT_MAX_CLIENTS + client->id);
+}
+
+void write_characteristic_json(json_stream *json, client_context_t *client, const homekit_characteristic_t *ch, characteristic_format_t format, const homekit_value_t *v) {
+    characteristic_info_t *ch_info = find_characteristic_info_by_characteristic(client->server, ch);
+    if (!ch_info) {
+        ERROR("Failed to lookup characteristic info for characteristic \"%s\"", ch->description);
+        return;
+    }
+
+    json_string(json, "aid"); json_uint32(json, ch_info->aid);
+    json_string(json, "iid"); json_uint32(json, ch_info->iid);
 
     if (format & characteristic_format_type) {
         json_string(json, "type"); json_string(json, ch->type);
@@ -417,7 +693,7 @@ void write_characteristic_json(json_stream *json, client_context_t *client, cons
     }
 
     if ((format & characteristic_format_events) && (ch->permissions & homekit_permissions_notify)) {
-        bool events = homekit_characteristic_has_notify_callback(ch, client_notify_characteristic, client);
+        bool events = client_has_subscribed_to_characteristic_events(client, ch);
         json_string(json, "ev"); json_boolean(json, events);
     }
 
@@ -503,61 +779,74 @@ void write_characteristic_json(json_stream *json, client_context_t *client, cons
     }
 
     if (ch->permissions & homekit_permissions_paired_read) {
-        homekit_value_t v = value ? *value : ch->getter_ex ? ch->getter_ex(ch) : ch->value;
-
-        if (v.is_null) {
+        if (v->is_null) {
             // json_string(json, "value"); json_null(json);
-        } else if (v.format != ch->format) {
+        } else if (v->format != ch->format) {
             ERROR("Characteristic value format is different from characteristic format");
         } else {
-            switch(v.format) {
+            switch(v->format) {
                 case homekit_format_bool: {
-                    json_string(json, "value"); json_boolean(json, v.bool_value);
+                    json_string(json, "value"); json_boolean(json, v->bool_value);
                     break;
                 }
                 case homekit_format_uint8: {
-                    json_string(json, "value"); json_uint8(json, v.uint8_value);
+                    json_string(json, "value"); json_uint8(json, v->uint8_value);
                     break;
                 }
                 case homekit_format_uint16: {
-                    json_string(json, "value"); json_uint16(json, v.uint16_value);
+                    json_string(json, "value"); json_uint16(json, v->uint16_value);
                     break;
                 }
                 case homekit_format_uint32: {
-                    json_string(json, "value"); json_uint32(json, v.uint32_value);
+                    json_string(json, "value"); json_uint32(json, v->uint32_value);
                     break;
                 }
                 case homekit_format_uint64: {
-                    json_string(json, "value"); json_uint64(json, v.uint64_value);
+                    json_string(json, "value"); json_uint64(json, v->uint64_value);
                     break;
                 }
                 case homekit_format_int: {
-                    json_string(json, "value"); json_integer(json, v.int_value);
+                    json_string(json, "value"); json_integer(json, v->int_value);
                     break;
                 }
                 case homekit_format_float: {
-                    json_string(json, "value"); json_float(json, v.float_value);
+                    json_string(json, "value"); json_float(json, v->float_value);
                     break;
                 }
                 case homekit_format_string: {
-                    json_string(json, "value"); json_string(json, v.string_value);
+                    json_string(json, "value"); json_string(json, v->string_value);
                     break;
                 }
                 case homekit_format_tlv: {
                     json_string(json, "value");
-                    if (!v.tlv_values) {
+                    if (!v->tlv_values) {
                         json_string(json, "");
                     } else {
                         size_t tlv_size = 0;
-                        tlv_format(v.tlv_values, NULL, &tlv_size);
+                        tlv_format(v->tlv_values, NULL, &tlv_size);
                         if (tlv_size == 0) {
                             json_string(json, "");
                         } else {
                             byte *tlv_data = malloc(tlv_size);
-                            tlv_format(v.tlv_values, tlv_data, &tlv_size);
+                            if (!tlv_data) {
+                                CLIENT_ERROR(client, "Failed to allocate %d bytes for characteristic TLV data", tlv_size);
+                                json_string(json, "");
+                                break;
+                            }
+                            if (tlv_format(v->tlv_values, tlv_data, &tlv_size)) {
+                                CLIENT_ERROR(client, "Failed to format TLV characteristic data");
+                                json_string(json, "");
+                                break;
+                            }
 
                             size_t encoded_tlv_size = base64_encoded_size(tlv_data, tlv_size);
                             byte *encoded_tlv_data = malloc(encoded_tlv_size + 1);
+                            if (!encoded_tlv_data) {
+                                CLIENT_ERROR(client, "Failed to allocate %d bytes for encoding characteristic TLV data", encoded_tlv_size + 1);
+                                free(tlv_data);
+                                json_string(json, "");
+                                break;
+                            }
                             base64_encode(tlv_data, tlv_size, encoded_tlv_data);
                             encoded_tlv_data[encoded_tlv_size] = 0;
 
@@ -571,12 +860,17 @@ void write_characteristic_json(json_stream *json, client_context_t *client, cons
                 }
                 case homekit_format_data: {
                     json_string(json, "value");
-                    if (!v.data_value || v.data_size == 0) {
+                    if (!v->data_value || v->data_size == 0) {
                         json_string(json, "");
                     } else {
-                        size_t encoded_data_size = base64_encoded_size(v.data_value, v.data_size);
+                        size_t encoded_data_size = base64_encoded_size(v->data_value, v->data_size);
                         byte *encoded_data = malloc(encoded_data_size + 1);
-                        base64_encode(v.data_value, v.data_size, encoded_data);
+                        if (!encoded_data) {
+                            CLIENT_ERROR(client, "Failed to allocate %d bytes for encoding characteristic data", encoded_data_size + 1);
+                            json_string(json, "");
+                            break;
+                        }
+                        base64_encode(v->data_value, v->data_size, encoded_data);
                         encoded_data[encoded_data_size] = 0;
 
                         json_string(json, (char*) encoded_data);
@@ -588,18 +882,13 @@ void write_characteristic_json(json_stream *json, client_context_t *client, cons
                 }
             }
         }
-
-        if (!value && ch->getter_ex) {
-            // called getter to get value, need to free it
-            homekit_value_destruct(&v);
-        }
     }
 }
 
 
-int client_send_encrypted(
+int client_send_encryptedv(
     client_context_t *context,
-    byte *payload, size_t size
+    uint8_t n, const byte **part_data, size_t *part_sizes
 ) {
     if (!context || !context->encrypted)
         return -1;
@@ -608,16 +897,32 @@ int client_send_encrypted(
     memset(nonce, 0, sizeof(nonce));
 
     byte encrypted[1024 + 18];
-    int payload_offset = 0;
 
-    while (payload_offset < size) {
-        size_t chunk_size = size - payload_offset;
-        if (chunk_size > 1024)
-            chunk_size = 1024;
+    uint8_t part_index = 0;
+    size_t part_offset = 0;
 
-        byte aead[2] = {chunk_size % 256, chunk_size / 256};
+    byte *aead = encrypted;
 
-        memcpy(encrypted, aead, 2);
+    while (part_index < n) {
+        size_t chunk_size = 0;
+        while (part_index < n && chunk_size < 1024) {
+            size_t extra_size = part_sizes[part_index] - part_offset;
+            if (chunk_size + extra_size > 1024) {
+                extra_size = 1024 - chunk_size;
+            }
+
+            memcpy(encrypted+2+chunk_size, part_data[part_index]+part_offset, extra_size);
+
+            chunk_size += extra_size;
+            part_offset += extra_size;
+            if (part_offset >= part_sizes[part_index]) {
+                part_index++;
+                part_offset = 0;
+            }
+        }
+
+        aead[0] = chunk_size & 0xff;
+        aead[1] = chunk_size >> 8;
 
         byte i = 4;
         int x = context->count_reads++;
@@ -629,15 +934,13 @@ int client_send_encrypted(
         size_t available = sizeof(encrypted) - 2;
         int r = crypto_chacha20poly1305_encrypt(
             context->read_key, nonce, aead, 2,
-            payload+payload_offset, chunk_size,
+            encrypted+2, chunk_size,
             encrypted+2, &available
         );
         if (r) {
             ERROR("Failed to chacha encrypt payload (code %d)", r);
             return -1;
         }
-
-        payload_offset += chunk_size;
 
         write(context->socket, encrypted, available + 2);
     }
@@ -708,65 +1011,60 @@ int client_decrypt(
 void homekit_setup_mdns(homekit_server_t *server);
 
 
-void client_notify_characteristic(homekit_characteristic_t *ch, homekit_value_t value, void *context) {
-    client_context_t *client = context;
-
-    if (client->current_characteristic == ch && client->current_value && homekit_value_equal(client->current_value, &value))
-        // This value is set by this client, no need to send notification
-        return;
-
-    DEBUG("Got characteristic %d.%d change event", ch->service->accessory->id, ch->id);
-
-    if (!client->event_queue) {
-        ERROR("Client has no event queue. Skipping notification");
-        return;
-    }
-
-    characteristic_event_t *event = malloc(sizeof(characteristic_event_t));
-    event->characteristic = ch;
-    homekit_value_copy(&event->value, &value);
-
-    DEBUG("Sending event to client %d", client->socket);
-
-    xQueueSendToBack(client->event_queue, &event, 10);
-}
-
-
-void client_send(client_context_t *context, byte *data, size_t data_size) {
+void client_sendv(client_context_t *context, uint8_t n, const byte **data, size_t *data_sizes) {
 #if HOMEKIT_DEBUG
+    size_t data_size = 0;
+    for (uint8_t i=0; i < n; i++)
+        data_size += data_sizes[i];
+
     if (data_size < 4096) {
-        char *payload = binary_to_string(data, data_size);
-        CLIENT_DEBUG(context, "Sending payload: %s", payload);
-        free(payload);
+        char *payload = binary_to_stringv(n, data, data_sizes);
+        if (payload) {
+            CLIENT_DEBUG(context, "Sending payload: %s", payload);
+            free(payload);
+        } else {
+            CLIENT_DEBUG(context, "Sending payload of size %d", data_size);
+        }
     }
 #endif
 
     if (context->encrypted) {
-        int r = client_send_encrypted(context, data, data_size);
+        int r = client_send_encryptedv(context, n, data, data_sizes);
         if (r) {
             CLIENT_ERROR(context, "Failed to encrypt response (code %d)", r);
             return;
         }
     } else {
-        write(context->socket, data, data_size);
+        // 5 parts should be enough to send everything at one go in all existing
+        // cases, but just in case implementing chunked sending
+        struct iovec parts[5];
+        for (uint8_t i=0; i < n;) {
+            uint8_t _n = (n - i > 4) ? 4 : n - i;
+            for (uint8_t j=0; j < _n; i++, j++) {
+                parts[j].iov_base = (void *)data[i];
+                parts[j].iov_len = data_sizes[i];
+            }
+
+            lwip_writev(context->socket, parts, _n);
+        }
     }
+}
+
+
+void client_send(client_context_t *context, byte *data, size_t data_size) {
+    client_sendv(context, 1, (const byte*[]){ data }, (size_t[]){ data_size });
 }
 
 
 void client_send_chunk(byte *data, size_t size, void *arg) {
     client_context_t *context = arg;
 
-    size_t payload_size = size + 8;
-    byte *payload = malloc(payload_size);
+    byte chunk_header[8];
+    size_t chunk_header_size = snprintf((char *)chunk_header, sizeof(chunk_header), "%x\r\n", size);
 
-    int offset = snprintf((char *)payload, payload_size, "%x\r\n", size);
-    memcpy(payload + offset, data, size);
-    payload[offset + size] = '\r';
-    payload[offset + size + 1] = '\n';
-
-    client_send(context, payload, offset + size + 2);
-
-    free(payload);
+    client_sendv(context, 3,
+                 (const byte*[]){chunk_header, data, (byte*)"\r\n"},
+                 (size_t[]){chunk_header_size, size, 2});
 }
 
 
@@ -784,99 +1082,38 @@ void send_404_response(client_context_t *context) {
 typedef struct _client_event {
     const homekit_characteristic_t *characteristic;
     homekit_value_t value;
-
-    struct _client_event *next;
 } client_event_t;
 
 
-void send_client_events(client_context_t *context, client_event_t *events) {
-    CLIENT_DEBUG(context, "Sending EVENT");
-    DEBUG_HEAP();
+static byte tlv_200_response_headers[] =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: application/pairing+tlv8\r\n"
+    "Transfer-Encoding: chunked\r\n"
+    "Connection: keep-alive\r\n\r\n";
 
-    static byte http_headers[] =
-        "EVENT/1.0 200 OK\r\n"
-        "Content-Type: application/hap+json\r\n"
-        "Transfer-Encoding: chunked\r\n\r\n";
 
-    client_send(context, http_headers, sizeof(http_headers)-1);
+tlv_stream_t *client_start_tlv_response(client_context_t *context) {
+    client_send(context, tlv_200_response_headers, sizeof(tlv_200_response_headers)-1);
 
-    // ~35 bytes per event JSON
-    // 256 should be enough for ~7 characteristic updates
-    json_stream *json = json_new(256, client_send_chunk, context);
-    json_object_start(json);
-    json_string(json, "characteristics"); json_array_start(json);
+    tlv_stream_t *tlv = &context->server->tlv_stream;
+    tlv_stream_set_context(tlv, context);
+    tlv_stream_reset(tlv);
 
-    client_event_t *e = events;
-    while (e) {
-        json_object_start(json);
-        write_characteristic_json(json, context, e->characteristic, 0, &e->value);
-        json_object_end(json);
+    return tlv;
+}
 
-        e = e->next;
-    }
-
-    json_array_end(json);
-    json_object_end(json);
-
-    json_flush(json);
-    json_free(json);
-
+void client_finish_tlv_response(client_context_t *context) {
+    tlv_stream_flush(&context->server->tlv_stream);
     client_send_chunk(NULL, 0, context);
 }
 
-
-void send_tlv_response(client_context_t *context, tlv_values_t *values);
-
 void send_tlv_error_response(client_context_t *context, int state, TLVError error) {
-    tlv_values_t *response = tlv_new();
-    tlv_add_integer_value(response, TLVType_State, 1, state);
-    tlv_add_integer_value(response, TLVType_Error, 1, error);
+    tlv_stream_t *tlv = client_start_tlv_response(context);
 
-    send_tlv_response(context, response);
-}
+    tlv_stream_add_integer_value(tlv, TLVType_State, 1, state);
+    tlv_stream_add_integer_value(tlv, TLVType_Error, 1, error);
 
-
-void send_tlv_response(client_context_t *context, tlv_values_t *values) {
-    CLIENT_DEBUG(context, "Sending TLV response");
-    TLV_DEBUG(values);
-
-    size_t payload_size = 0;
-    tlv_format(values, NULL, &payload_size);
-
-    byte *payload = malloc(payload_size);
-    int r = tlv_format(values, payload, &payload_size);
-    if (r) {
-        CLIENT_ERROR(context, "Failed to format TLV payload (code %d)", r);
-        free(payload);
-        return;
-    }
-
-    tlv_free(values);
-
-    static char *http_headers =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: application/pairing+tlv8\r\n"
-        "Content-Length: %d\r\n"
-        "Connection: keep-alive\r\n\r\n";
-
-    int response_size = strlen(http_headers) + payload_size + 32;
-    char *response = malloc(response_size);
-    int response_len = snprintf(response, response_size, http_headers, payload_size);
-
-    if (response_size - response_len < payload_size + 1) {
-        CLIENT_ERROR(context, "Incorrect response buffer size %d: headers took %d, payload size %d", response_size, response_len, payload_size);
-        free(response);
-        free(payload);
-        return;
-    }
-    memcpy(response+response_len, payload, payload_size);
-    response_len += payload_size;
-
-    free(payload);
-
-    client_send(context, (byte *)response, response_len);
-
-    free(response);
+    client_finish_tlv_response(context);
 }
 
 
@@ -920,7 +1157,7 @@ void send_json_response(client_context_t *context, int status_code, byte *payloa
     int response_size = strlen(http_headers) + payload_size + strlen(status_text) + 32;
     char *response = malloc(response_size);
     if (!response) {
-        CLIENT_ERROR(context, "Failed to allocate response buffer of size %d", response_size);
+        CLIENT_ERROR(context, "Failed to allocate %d bytes for response buffer", response_size);
         return;
     }
     int response_len = snprintf(response, response_size, http_headers, status_code, status_text, payload_size);
@@ -1017,7 +1254,17 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
 #endif
 
     tlv_values_t *message = tlv_new();
-    tlv_parse(data, size, message);
+    if (!message) {
+        CLIENT_ERROR(context, "Failed to allocate memory for TLV payload");
+        send_tlv_error_response(context, 2, TLVError_Unknown);
+        return;
+    }
+    if (tlv_parse(data, size, message)) {
+        CLIENT_ERROR(context, "Failed to parse TLV payload");
+        tlv_free(message);
+        send_tlv_error_response(context, 2, TLVError_Unknown);
+        return;
+    }
 
     TLV_DEBUG(message);
 
@@ -1039,6 +1286,11 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
                 }
             } else {
                 context->server->pairing_context = pairing_context_new();
+                if (!context->server->pairing_context) {
+                    CLIENT_ERROR(context, "Refusing to pair: failed to allocate memory for pairing context");
+                    send_tlv_error_response(context, 2, TLVError_Unknown);
+                    break;
+                }
                 context->server->pairing_context->client = context;
             }
 
@@ -1075,6 +1327,17 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             crypto_srp_get_public_key(context->server->pairing_context->srp, NULL, &context->server->pairing_context->public_key_size);
 
             context->server->pairing_context->public_key = malloc(context->server->pairing_context->public_key_size);
+            if (!context->server->pairing_context->public_key) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for dumping SPR public key",
+                             context->server->pairing_context->public_key_size);
+
+                pairing_context_free(context->server->pairing_context);
+                context->server->pairing_context = NULL;
+
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
+
             int r = crypto_srp_get_public_key(context->server->pairing_context->srp, context->server->pairing_context->public_key, &context->server->pairing_context->public_key_size);
             if (r) {
                 CLIENT_ERROR(context, "Failed to dump SPR public key (code %d)", r);
@@ -1090,6 +1353,16 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             crypto_srp_get_salt(context->server->pairing_context->srp, NULL, &salt_size);
 
             byte *salt = malloc(salt_size);
+            if (!salt) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for salt", salt_size);
+
+                pairing_context_free(context->server->pairing_context);
+                context->server->pairing_context = NULL;
+
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
+
             r = crypto_srp_get_salt(context->server->pairing_context->srp, salt, &salt_size);
             if (r) {
                 CLIENT_ERROR(context, "Failed to get salt (code %d)", r);
@@ -1102,14 +1375,16 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
                 break;
             }
 
-            tlv_values_t *response = tlv_new();
-            tlv_add_value(response, TLVType_PublicKey, context->server->pairing_context->public_key, context->server->pairing_context->public_key_size);
-            tlv_add_value(response, TLVType_Salt, salt, salt_size);
-            tlv_add_integer_value(response, TLVType_State, 1, 2);
+            tlv_stream_t *tlv = client_start_tlv_response(context);
+
+            tlv_stream_add_value(tlv, TLVType_PublicKey, context->server->pairing_context->public_key, context->server->pairing_context->public_key_size);
+            tlv_stream_add_value(tlv, TLVType_Salt, salt, salt_size);
+            tlv_stream_add_integer_value(tlv, TLVType_State, 1, 2);
+
+            client_finish_tlv_response(context);
 
             free(salt);
 
-            send_tlv_response(context, response);
             break;
         }
         case 3: {
@@ -1161,15 +1436,23 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             crypto_srp_get_proof(context->server->pairing_context->srp, NULL, &server_proof_size);
 
             byte *server_proof = malloc(server_proof_size);
+            if (!server_proof) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for own proof", server_proof_size);
+                send_tlv_error_response(context, 4, TLVError_Authentication);
+                break;
+            }
+
             r = crypto_srp_get_proof(context->server->pairing_context->srp, server_proof, &server_proof_size);
 
-            tlv_values_t *response = tlv_new();
-            tlv_add_integer_value(response, TLVType_State, 1, 4);
-            tlv_add_value(response, TLVType_Proof, server_proof, server_proof_size);
+            tlv_stream_t *tlv = client_start_tlv_response(context);
+
+            tlv_stream_add_integer_value(tlv, TLVType_State, 1, 4);
+            tlv_stream_add_value(tlv, TLVType_Proof, server_proof, server_proof_size);
+
+            client_finish_tlv_response(context);
 
             free(server_proof);
 
-            send_tlv_response(context, response);
             break;
         }
         case 5: {
@@ -1212,7 +1495,14 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             );
 
             byte *decrypted_data = malloc(decrypted_data_size);
-            // TODO: check malloc result
+            if (!decrypted_data) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for decrypting data",
+                             decrypted_data_size);
+
+                send_tlv_error_response(context, 6, TLVError_Authentication);
+                break;
+            }
+
             r = crypto_chacha20poly1305_decrypt(
                 shared_secret, (byte *)"\x0\x0\x0\x0PS-Msg05", NULL, 0,
                 tlv_encrypted_data->value, tlv_encrypted_data->size,
@@ -1228,6 +1518,15 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             }
 
             tlv_values_t *decrypted_message = tlv_new();
+            if (!decrypted_message) {
+                CLIENT_ERROR(context, "Failed to allocate memory for decrypted TLV");
+
+                free(decrypted_data);
+
+                send_tlv_error_response(context, 6, TLVError_Authentication);
+                break;
+            }
+
             r = tlv_parse(decrypted_data, decrypted_data_size, decrypted_message);
             if (r) {
                 CLIENT_ERROR(context, "Failed to parse decrypted TLV (code %d)", r);
@@ -1313,6 +1612,15 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
 
             size_t device_info_size = device_x_size + tlv_device_id->size + tlv_device_public_key->size;
             byte *device_info = malloc(device_info_size);
+            if (!device_info) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for DeviceX", device_info_size);
+
+                tlv_free(decrypted_message);
+
+                send_tlv_error_response(context, 6, TLVError_Authentication);
+                break;
+            }
+
             memcpy(device_info,
                    device_x,
                    device_x_size);
@@ -1352,9 +1660,7 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
                 break;
             }
 
-            char *device_id = strndup((const char *)tlv_device_id->value, tlv_device_id->size);
-            INFO("Added pairing with %s", device_id);
-            free(device_id);
+            INFO("Added pairing with %.*s", tlv_device_id->size, (char *)tlv_device_id->value);
 
             tlv_free(decrypted_message);
 
@@ -1365,6 +1671,14 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             crypto_ed25519_export_public_key(&context->server->accessory_key, NULL, &accessory_public_key_size);
 
             byte *accessory_public_key = malloc(accessory_public_key_size);
+            if (!accessory_public_key) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for accessory public key",
+                             accessory_public_key_size);
+
+                send_tlv_error_response(context, 6, TLVError_Authentication);
+                break;
+            }
+
             r = crypto_ed25519_export_public_key(&context->server->accessory_key, accessory_public_key, &accessory_public_key_size);
             if (r) {
                 CLIENT_ERROR(context, "Failed to export accessory public key (code %d)", r);
@@ -1378,6 +1692,15 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             size_t accessory_id_size = sizeof(context->server->accessory_id) - 1;
             size_t accessory_info_size = HKDF_HASH_SIZE + accessory_id_size + accessory_public_key_size;
             byte *accessory_info = malloc(accessory_info_size);
+            if (!accessory_info) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for AccessoryX",
+                             accessory_info_size);
+
+                free(accessory_public_key);
+
+                send_tlv_error_response(context, 6, TLVError_Unknown);
+                break;
+            }
 
             CLIENT_DEBUG(context, "Calculating AccessoryX");
             size_t accessory_x_size = accessory_info_size;
@@ -1414,6 +1737,17 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             );
 
             byte *accessory_signature = malloc(accessory_signature_size);
+            if (!accessory_signature) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for accessory signature",
+                             accessory_signature_size);
+
+                free(accessory_public_key);
+                free(accessory_info);
+
+                send_tlv_error_response(context, 6, TLVError_Unknown);
+                break;
+            }
+
             r = crypto_ed25519_sign(
                 &context->server->accessory_key,
                 accessory_info, accessory_info_size,
@@ -1433,6 +1767,16 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             free(accessory_info);
 
             tlv_values_t *response_message = tlv_new();
+            if (!response_message) {
+                CLIENT_ERROR(context, "Failed to allocate memory for TLV response");
+
+                free(accessory_signature);
+                free(accessory_public_key);
+
+                send_tlv_error_response(context, 6, TLVError_Unknown);
+                break;
+            }
+
             tlv_add_value(response_message, TLVType_Identifier,
                           (byte *)context->server->accessory_id, accessory_id_size);
             tlv_add_value(response_message, TLVType_PublicKey,
@@ -1449,6 +1793,16 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             tlv_format(response_message, NULL, &response_data_size);
 
             byte *response_data = malloc(response_data_size);
+            if (!response_data) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for TLV response",
+                             response_data_size);
+
+                tlv_free(response_message);
+
+                send_tlv_error_response(context, 6, TLVError_Unknown);
+                break;
+            }
+
             r = tlv_format(response_message, response_data, &response_data_size);
             if (r) {
                 CLIENT_ERROR(context, "Failed to format TLV response (code %d)", r);
@@ -1471,6 +1825,16 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
             );
 
             byte *encrypted_response_data = malloc(encrypted_response_data_size);
+            if (!encrypted_response_data) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for encrypted response data",
+                             encrypted_response_data_size);
+
+                free(response_data);
+
+                send_tlv_error_response(context, 6, TLVError_Unknown);
+                break;
+            }
+
             r = crypto_chacha20poly1305_encrypt(
                 shared_secret, (byte *)"\x0\x0\x0\x0PS-Msg06", NULL, 0,
                 response_data, response_data_size,
@@ -1488,14 +1852,16 @@ void homekit_server_on_pair_setup(client_context_t *context, const byte *data, s
                 break;
             }
 
-            tlv_values_t *response = tlv_new();
-            tlv_add_integer_value(response, TLVType_State, 1, 6);
-            tlv_add_value(response, TLVType_EncryptedData,
-                          encrypted_response_data, encrypted_response_data_size);
+            tlv_stream_t *tlv = client_start_tlv_response(context);
+
+            tlv_stream_add_integer_value(tlv, TLVType_State, 1, 6);
+            tlv_stream_add_value(tlv, TLVType_EncryptedData,
+                                 encrypted_response_data,
+                                 encrypted_response_data_size);
+
+            client_finish_tlv_response(context);
 
             free(encrypted_response_data);
-
-            send_tlv_response(context, response);
 
             pairing_context_free(context->server->pairing_context);
             context->server->pairing_context = NULL;
@@ -1528,12 +1894,22 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
     homekit_overclock_start();
 #endif
 
+    int r;
+
     tlv_values_t *message = tlv_new();
-    tlv_parse(data, size, message);
+    if (!message) {
+        CLIENT_ERROR(context, "Failed to allocate memory for TLV payload");
+        return;
+    }
+
+    r = tlv_parse(data, size, message);
+    if (r) {
+        CLIENT_ERROR(context, "Failed to parse TLV payload (code %d)", r);
+        tlv_free(message);
+        return;
+    }
 
     TLV_DEBUG(message);
-
-    int r;
 
     switch(tlv_get_integer_value(message, TLVType_State, -1)) {
         case 1: {
@@ -1581,6 +1957,15 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             crypto_curve25519_export_public(&my_key, NULL, &my_key_public_size);
 
             byte *my_key_public = malloc(my_key_public_size);
+            if (!my_key_public) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for exporting accessory Curve25519 public key",
+                             my_key_public_size);
+                crypto_curve25519_done(&my_key);
+                crypto_curve25519_done(&device_key);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
+
             r = crypto_curve25519_export_public(&my_key, my_key_public, &my_key_public_size);
             if (r) {
                 CLIENT_ERROR(context, "Failed to export accessory Curve25519 public key (code %d)", r);
@@ -1596,6 +1981,14 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             crypto_curve25519_shared_secret(&my_key, &device_key, NULL, &shared_secret_size);
 
             byte *shared_secret = malloc(shared_secret_size);
+            if (!shared_secret) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for Curve25519 shared secret",
+                             shared_secret_size);
+                free(my_key_public);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
+
             r = crypto_curve25519_shared_secret(&my_key, &device_key, shared_secret, &shared_secret_size);
             crypto_curve25519_done(&my_key);
             crypto_curve25519_done(&device_key);
@@ -1613,6 +2006,15 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             size_t accessory_info_size = my_key_public_size + accessory_id_size + tlv_device_public_key->size;
 
             byte *accessory_info = malloc(accessory_info_size);
+            if (!accessory_info) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for accessory info",
+                             accessory_info_size);
+                free(shared_secret);
+                free(my_key_public);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
+
             memcpy(accessory_info,
                    my_key_public, my_key_public_size);
             memcpy(accessory_info + my_key_public_size,
@@ -1628,6 +2030,16 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             );
 
             byte *accessory_signature = malloc(accessory_signature_size);
+            if (!accessory_signature) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for accessory signature",
+                             accessory_signature_size);
+                free(accessory_info);
+                free(shared_secret);
+                free(my_key_public);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
+
             r = crypto_ed25519_sign(
                 &context->server->accessory_key,
                 accessory_info, accessory_info_size,
@@ -1644,6 +2056,14 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             }
 
             tlv_values_t *sub_response = tlv_new();
+            if (!sub_response) {
+                CLIENT_ERROR(context, "Failed to allocate memory for TLV sub response");
+                free(accessory_signature);
+                free(shared_secret);
+                free(my_key_public);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
             tlv_add_value(sub_response, TLVType_Identifier,
                           (const byte *)context->server->accessory_id, accessory_id_size);
             tlv_add_value(sub_response, TLVType_Signature,
@@ -1655,6 +2075,15 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             tlv_format(sub_response, NULL, &sub_response_data_size);
 
             byte *sub_response_data = malloc(sub_response_data_size);
+            if (!sub_response_data) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for sub-TLV message",
+                             sub_response_data_size);
+                free(shared_secret);
+                free(my_key_public);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
+
             r = tlv_format(sub_response, sub_response_data, &sub_response_data_size);
             tlv_free(sub_response);
 
@@ -1679,6 +2108,16 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             );
 
             byte *session_key = malloc(session_key_size);
+            if (!session_key) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for session key",
+                             session_key_size);
+                free(sub_response_data);
+                free(shared_secret);
+                free(my_key_public);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
+
             r = crypto_hkdf(
                 shared_secret, shared_secret_size,
                 salt, sizeof(salt)-1,
@@ -1704,6 +2143,17 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             );
 
             byte *encrypted_response_data = malloc(encrypted_response_data_size);
+            if (!encrypted_response_data) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for encrypting sub response data",
+                             encrypted_response_data_size);
+                free(sub_response_data);
+                free(session_key);
+                free(shared_secret);
+                free(my_key_public);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
+
             r = crypto_chacha20poly1305_encrypt(
                 session_key, (byte *)"\x0\x0\x0\x0PV-Msg02", NULL, 0,
                 sub_response_data, sub_response_data_size,
@@ -1721,21 +2171,31 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
                 break;
             }
 
-            tlv_values_t *response = tlv_new();
-            tlv_add_integer_value(response, TLVType_State, 1, 2);
-            tlv_add_value(response, TLVType_PublicKey,
-                          my_key_public, my_key_public_size);
-            tlv_add_value(response, TLVType_EncryptedData,
-                          encrypted_response_data, encrypted_response_data_size);
+            tlv_stream_t *tlv = client_start_tlv_response(context);
+
+            tlv_stream_add_integer_value(tlv, TLVType_State, 1, 2);
+            tlv_stream_add_value(tlv, TLVType_PublicKey,
+                                 my_key_public, my_key_public_size);
+            tlv_stream_add_value(tlv, TLVType_EncryptedData,
+                                 encrypted_response_data,
+                                 encrypted_response_data_size);
+
+            client_finish_tlv_response(context);
 
             free(encrypted_response_data);
-
-            send_tlv_response(context, response);
 
             if (context->verify_context)
                 pair_verify_context_free(context->verify_context);
 
             context->verify_context = pair_verify_context_new();
+            if (!context->verify_context) {
+                CLIENT_ERROR(context, "Failed to allocate memory for verify context");
+                free(session_key);
+                free(shared_secret);
+                free(my_key_public);
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
             context->verify_context->secret = shared_secret;
             context->verify_context->secret_size = shared_secret_size;
 
@@ -1746,6 +2206,15 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             context->verify_context->accessory_public_key_size = my_key_public_size;
 
             context->verify_context->device_public_key = malloc(tlv_device_public_key->size);
+            if (!context->verify_context->device_public_key) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for device public key",
+                             tlv_device_public_key->size);
+                pair_verify_context_free(context->verify_context);
+                context->verify_context = NULL;
+
+                send_tlv_error_response(context, 2, TLVError_Unknown);
+                break;
+            }
             memcpy(context->verify_context->device_public_key,
                    tlv_device_public_key->value, tlv_device_public_key->size);
             context->verify_context->device_public_key_size = tlv_device_public_key->size;
@@ -1781,6 +2250,17 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             );
 
             byte *decrypted_data = malloc(decrypted_data_size);
+            if (!decrypted_data) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for decrypt data",
+                             decrypted_data_size);
+
+                pair_verify_context_free(context->verify_context);
+                context->verify_context = NULL;
+
+                send_tlv_error_response(context, 4, TLVError_Authentication);
+                break;
+            }
+
             r = crypto_chacha20poly1305_decrypt(
                 context->verify_context->session_key, (byte *)"\x0\x0\x0\x0PV-Msg03", NULL, 0,
                 tlv_encrypted_data->value, tlv_encrypted_data->size,
@@ -1798,6 +2278,16 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
             }
 
             tlv_values_t *decrypted_message = tlv_new();
+            if (!decrypted_message) {
+                CLIENT_ERROR(context, "Failed to allocate memory for decrypted message");
+
+                free(decrypted_data);
+                pair_verify_context_free(context->verify_context);
+                context->verify_context = NULL;
+
+                send_tlv_error_response(context, 4, TLVError_Authentication);
+                break;
+            }
             r = tlv_parse(decrypted_data, decrypted_data_size, decrypted_message);
             free(decrypted_data);
 
@@ -1836,13 +2326,11 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
                 break;
             }
 
-            char *device_id = strndup((const char *)tlv_device_id->value, tlv_device_id->size);
-            CLIENT_DEBUG(context, "Searching pairing with %s", device_id);
+            CLIENT_DEBUG(context, "Searching pairing with %.*s", tlv_device_id->size, tlv_device_id->value);
             pairing_t pairing;
-            if (homekit_storage_find_pairing(device_id, &pairing)) {
-                CLIENT_ERROR(context, "No pairing for %s found", device_id);
+            if (homekit_storage_find_pairing((const char *)tlv_device_id->value, &pairing)) {
+                CLIENT_ERROR(context, "No pairing for %.*s found", tlv_device_id->size, tlv_device_id->value);
 
-                free(device_id);
                 tlv_free(decrypted_message);
                 pair_verify_context_free(context->verify_context);
                 context->verify_context = NULL;
@@ -1851,8 +2339,7 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
                 break;
             }
 
-            CLIENT_INFO(context, "Found pairing with %s", device_id);
-            free(device_id);
+            CLIENT_INFO(context, "Found pairing with %.*s", tlv_device_id->size, tlv_device_id->value);
 
             byte permissions = pairing.permissions;
             int pairing_id = pairing.id;
@@ -1863,6 +2350,18 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
                 tlv_device_id->size;
 
             byte *device_info = malloc(device_info_size);
+            if (!device_info) {
+                CLIENT_ERROR(context, "Failed to allocate %d bytes for device info",
+                             device_info_size);
+
+                tlv_free(decrypted_message);
+                pair_verify_context_free(context->verify_context);
+                context->verify_context = NULL;
+
+                send_tlv_error_response(context, 4, TLVError_Authentication);
+                break;
+            }
+
             memcpy(device_info,
                    context->verify_context->device_public_key, context->verify_context->device_public_key_size);
             memcpy(device_info + context->verify_context->device_public_key_size,
@@ -1929,10 +2428,11 @@ void homekit_server_on_pair_verify(client_context_t *context, const byte *data, 
                 break;
             }
 
-            tlv_values_t *response = tlv_new();
-            tlv_add_integer_value(response, TLVType_State, 1, 4);
+            tlv_stream_t *tlv = client_start_tlv_response(context);
 
-            send_tlv_response(context, response);
+            tlv_stream_add_integer_value(tlv, TLVType_State, 1, 4);
+
+            client_finish_tlv_response(context);
 
             context->pairing_id = pairing_id;
             context->permissions = permissions;
@@ -1964,7 +2464,10 @@ void homekit_server_on_get_accessories(client_context_t *context) {
 
     client_send(context, json_200_response_headers, sizeof(json_200_response_headers)-1);
 
-    json_stream *json = json_new(1024, client_send_chunk, context);
+    json_stream *json = &context->server->json;
+    json_set_context(json, context);
+    json_reset(json);
+
     json_object_start(json);
     json_string(json, "accessories"); json_array_start(json);
 
@@ -1973,7 +2476,13 @@ void homekit_server_on_get_accessories(client_context_t *context) {
 
         json_object_start(json);
 
-        json_string(json, "aid"); json_uint32(json, accessory->id);
+        accessory_info_t *a_info = find_accessory_info(context->server, accessory);
+        if (!a_info) {
+            ERROR("Failed to lookup accessory info, skipping");
+            continue;
+        }
+
+        json_string(json, "aid"); json_uint32(json, a_info->aid);
         json_string(json, "services"); json_array_start(json);
 
         for (homekit_service_t **service_it = accessory->services; *service_it; service_it++) {
@@ -1981,14 +2490,25 @@ void homekit_server_on_get_accessories(client_context_t *context) {
 
             json_object_start(json);
 
-            json_string(json, "iid"); json_uint32(json, service->id);
+            service_info_t *s_info = find_service_info(context->server, service);
+            if (!s_info) {
+                ERROR("Failed to lookup service info for service type \"%s\", skipping", service->type);
+                continue;
+            }
+
+            json_string(json, "iid"); json_uint32(json, s_info->iid);
             json_string(json, "type"); json_string(json, service->type);
             json_string(json, "hidden"); json_boolean(json, service->hidden);
             json_string(json, "primary"); json_boolean(json, service->primary);
             if (service->linked) {
                 json_string(json, "linked"); json_array_start(json);
                 for (homekit_service_t **linked=service->linked; *linked; linked++) {
-                    json_uint32(json, (*linked)->id);
+                    service_info_t *linked_info = find_service_info(context->server, *linked);
+                    if (!linked_info) {
+                        ERROR("Failed to lookup service info for linked service of type \"%s\", skipping", (*linked)->type);
+                        continue;
+                    }
+                    json_uint32(json, linked_info->iid);
                 }
                 json_array_end(json);
             }
@@ -1999,14 +2519,18 @@ void homekit_server_on_get_accessories(client_context_t *context) {
                 homekit_characteristic_t *ch = *ch_it;
 
                 json_object_start(json);
+
+                homekit_value_t value = ch->getter_ex(ch);
                 write_characteristic_json(
                     json, context, ch,
                       characteristic_format_type
                     | characteristic_format_meta
                     | characteristic_format_perms
                     | characteristic_format_events,
-                    NULL
+                    &value
                 );
+                homekit_value_destruct(&value);
+
                 json_object_end(json);
             }
 
@@ -2022,7 +2546,6 @@ void homekit_server_on_get_accessories(client_context_t *context) {
     json_object_end(json); // response
 
     json_flush(json);
-    json_free(json);
 
     client_send_chunk(NULL, 0, context);
 }
@@ -2031,53 +2554,22 @@ void homekit_server_on_get_characteristics(client_context_t *context) {
     CLIENT_INFO(context, "Get Characteristics");
     DEBUG_HEAP();
 
-    query_param_t *qp = context->endpoint_params;
-    while (qp) {
-        CLIENT_DEBUG(context, "Query paramter %s = %s", qp->name, qp->value);
-        qp = qp->next;
-    }
-
-    query_param_t *id_param = query_params_find(context->endpoint_params, "id");
-    if (!id_param) {
+    if (context->server->endpoint_params.ids[0].aid == 0) {
         CLIENT_ERROR(context, "Invalid get characteristics request: missing ID parameter");
         send_json_error_response(context, 400, HAPStatus_InvalidValue);
         return;
     }
 
-    bool bool_endpoint_param(const char *name) {
-        query_param_t *param = query_params_find(context->endpoint_params, name);
-        return param && param->value && !strcmp(param->value, "1");
-    }
-
-    characteristic_format_t format = 0;
-    if (bool_endpoint_param("meta"))
-        format |= characteristic_format_meta;
-
-    if (bool_endpoint_param("perms"))
-        format |= characteristic_format_perms;
-
-    if (bool_endpoint_param("type"))
-        format |= characteristic_format_type;
-
-    if (bool_endpoint_param("ev"))
-        format |= characteristic_format_events;
 
     bool success = true;
 
-    char *id = strdup(id_param->value);
-    char *ch_id;
-    char *_id = id;
-    while ((ch_id = strsep(&_id, ","))) {
-        char *dot = strstr(ch_id, ".");
-        if (!dot) {
-            send_json_error_response(context, 400, HAPStatus_InvalidValue);
-            free(id);
-            return;
-        }
+    int id_index = 0;
+    while (id_index < countof(context->server->endpoint_params.ids) &&
+           context->server->endpoint_params.ids[id_index].aid != 0) {
+        uint16_t aid = context->server->endpoint_params.ids[id_index].aid;
+        uint16_t iid = context->server->endpoint_params.ids[id_index].iid;
 
-        *dot = 0;
-        int aid = atoi(ch_id);
-        int iid = atoi(dot+1);
+        id_index++;
 
         CLIENT_DEBUG(context, "Requested characteristic info for %d.%d", aid, iid);
         homekit_characteristic_t *ch = homekit_characteristic_by_aid_and_iid(context->server->config->accessories, aid, iid);
@@ -2092,16 +2584,16 @@ void homekit_server_on_get_characteristics(client_context_t *context) {
         }
     }
 
-    free(id);
-    id = strdup(id_param->value);
-
     if (success) {
         client_send(context, json_200_response_headers, sizeof(json_200_response_headers)-1);
     } else {
         client_send(context, json_207_response_headers, sizeof(json_207_response_headers)-1);
     }
 
-    json_stream *json = json_new(256, client_send_chunk, context);
+    json_stream *json = &context->server->json;
+    json_set_context(json, context);
+    json_reset(json);
+
     json_object_start(json);
     json_string(json, "characteristics"); json_array_start(json);
 
@@ -2113,51 +2605,54 @@ void homekit_server_on_get_characteristics(client_context_t *context) {
         json_object_end(json);
     }
 
-    _id = id;
-    while ((ch_id = strsep(&_id, ","))) {
-        char *dot = strstr(ch_id, ".");
-        *dot = 0;
-        int aid = atoi(ch_id);
-        int iid = atoi(dot+1);
+    id_index = 0;
+    while (id_index < countof(context->server->endpoint_params.ids) &&
+           context->server->endpoint_params.ids[id_index].aid != 0) {
+        uint16_t aid = context->server->endpoint_params.ids[id_index].aid;
+        uint16_t iid = context->server->endpoint_params.ids[id_index].iid;
 
-        CLIENT_DEBUG(context, "Requested characteristic info for %d.%d", aid, iid);
         homekit_characteristic_t *ch = homekit_characteristic_by_aid_and_iid(context->server->config->accessories, aid, iid);
         if (!ch) {
+            CLIENT_ERROR(context, "Requested characteristic %d.%d not found", aid, iid);
             write_characteristic_error(json, aid, iid, HAPStatus_NoResource);
             continue;
         }
 
         if (!(ch->permissions & homekit_permissions_paired_read)) {
+            CLIENT_ERROR(context, "Requested characteristic %d.%d is not readable", aid, iid);
             write_characteristic_error(json, aid, iid, HAPStatus_WriteOnly);
             continue;
         }
 
+        CLIENT_INFO(context, "Requested characteristic info for %d.%d (\"%s\")", aid, iid, ch->description);
+
         json_object_start(json);
-        write_characteristic_json(json, context, ch, format, NULL);
+
+        homekit_value_t value = ch->getter_ex(ch);
+        write_characteristic_json(json, context, ch, context->server->endpoint_params.format, &value);
+        homekit_value_destruct(&value);
+
         if (!success) {
             json_string(json, "status"); json_uint8(json, HAPStatus_Success);
         }
         json_object_end(json);
+
+        id_index++;
     }
 
     json_array_end(json);
     json_object_end(json); // response
 
     json_flush(json);
-    json_free(json);
 
     client_send_chunk(NULL, 0, context);
-
-    free(id);
 }
 
 void homekit_server_on_update_characteristics(client_context_t *context, const byte *data, size_t size) {
     CLIENT_INFO(context, "Update Characteristics");
     DEBUG_HEAP();
 
-    char *data1 = strndup((char *)data, size);
-    cJSON *json = cJSON_Parse(data1);
-    free(data1);
+    cJSON *json = cJSON_Parse((char *)data);
 
     if (!json) {
         CLIENT_ERROR(context, "Failed to parse request JSON");
@@ -2236,14 +2731,10 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
                         return HAPStatus_InvalidValue;
                     }
 
-                    CLIENT_DEBUG(context, "Updating characteristic %d.%d with boolean %s", aid, iid, value ? "true" : "false");
+                    CLIENT_INFO(context, "Updating characteristic %d.%d (\"%s\") with boolean %s", aid, iid, ch->description, value ? "true" : "false");
 
                     h_value = HOMEKIT_BOOL(value);
-                    if (ch->setter_ex) {
-                        ch->setter_ex(ch, h_value);
-                    } else {
-                        ch->value = h_value;
-                    }
+
                     break;
                 }
                 case homekit_format_uint8:
@@ -2342,7 +2833,7 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
                         }
                     }
 
-                    CLIENT_DEBUG(context, "Updating characteristic %d.%d with integer %g", aid, iid, value);
+                    CLIENT_INFO(context, "Updating characteristic %d.%d (\"%s\") with integer %g", aid, iid, ch->description, value);
 
                     switch (ch->format) {
                         case homekit_format_uint8:
@@ -2366,11 +2857,6 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
                             return HAPStatus_InvalidValue;
                     }
 
-                    if (ch->setter_ex) {
-                        ch->setter_ex(ch, h_value);
-                    } else {
-                        ch->value = h_value;
-                    }
                     break;
                 }
                 case homekit_format_float: {
@@ -2386,14 +2872,10 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
                         return HAPStatus_InvalidValue;
                     }
 
-                    CLIENT_DEBUG(context, "Updating characteristic %d.%d with %g", aid, iid, value);
+                    CLIENT_INFO(context, "Updating characteristic %d.%d (\"%s\") with %g", aid, iid, ch->description, value);
 
                     h_value = HOMEKIT_FLOAT(value);
-                    if (ch->setter_ex) {
-                        ch->setter_ex(ch, h_value);
-                    } else {
-                        ch->value = h_value;
-                    }
+
                     break;
                 }
                 case homekit_format_string: {
@@ -2410,15 +2892,10 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
                         return HAPStatus_InvalidValue;
                     }
 
-                    CLIENT_DEBUG(context, "Updating characteristic %d.%d with \"%s\"", aid, iid, value);
+                    CLIENT_INFO(context, "Updating characteristic %d.%d (\"%s\") with \"%s\"", aid, iid, ch->description, value);
 
                     h_value = HOMEKIT_STRING(value);
-                    if (ch->setter_ex) {
-                        ch->setter_ex(ch, h_value);
-                    } else {
-                        homekit_value_destruct(&ch->value);
-                        homekit_value_copy(&ch->value, &h_value);
-                    }
+
                     break;
                 }
                 case homekit_format_tlv: {
@@ -2438,6 +2915,13 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
 
                     size_t tlv_size = base64_decoded_size((unsigned char*)value, value_len);
                     byte *tlv_data = malloc(tlv_size);
+                    if (!tlv_data) {
+                        CLIENT_ERROR(context,
+                                     "Failed to update %d.%d: "
+                                     "error allocating %d bytes for Base64 decoding",
+                                     aid, iid, tlv_size);
+                        return HAPStatus_InvalidValue;
+                    }
                     if (base64_decode((byte*) value, value_len, tlv_data) < 0) {
                         free(tlv_data);
                         CLIENT_ERROR(context, "Failed to update %d.%d: error Base64 decoding", aid, iid);
@@ -2445,6 +2929,11 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
                     }
 
                     tlv_values_t *tlv_values = tlv_new();
+                    if (!tlv_values) {
+                        free(tlv_data);
+                        CLIENT_ERROR(context, "Failed to update %d.%d: error allocating memory for TLV values", aid, iid);
+                        return HAPStatus_InvalidValue;
+                    }
                     int r = tlv_parse(tlv_data, tlv_size, tlv_values);
                     free(tlv_data);
 
@@ -2453,7 +2942,7 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
                         return HAPStatus_InvalidValue;
                     }
 
-                    CLIENT_DEBUG(context, "Updating characteristic %d.%d with TLV:", aid, iid);
+                    CLIENT_INFO(context, "Updating characteristic %d.%d (\"%s\") with TLV:", aid, iid, ch->description);
                     for (tlv_t *t=tlv_values->head; t; t=t->next) {
                         char *escaped_payload = binary_to_string(t->value, t->size);
                         CLIENT_DEBUG(context, "  Type %d value (%d bytes): %s", t->type, t->size, escaped_payload);
@@ -2461,12 +2950,6 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
                     }
 
                     h_value = HOMEKIT_TLV(tlv_values);
-                    if (ch->setter_ex) {
-                        ch->setter_ex(ch, h_value);
-                    } else {
-                        homekit_value_destruct(&ch->value);
-                        homekit_value_copy(&ch->value, &h_value);
-                    }
 
                     tlv_free(tlv_values);
                     break;
@@ -2490,35 +2973,34 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
 
                     size_t data_size = base64_decoded_size((unsigned char*)value, value_len);
                     byte *data = malloc(data_size);
+                    if (!data) {
+                        CLIENT_ERROR(context,
+                                     "Failed to update %d.%d: "
+                                     "error allocating %d bytes for Base64 decoding",
+                                     aid, iid, data_size);
+                        return HAPStatus_InvalidValue;
+                    }
+
                     if (base64_decode((byte*) value, value_len, data) < 0) {
                         free(data);
                         CLIENT_ERROR(context, "Failed to update %d.%d: error Base64 decoding", aid, iid);
                         return HAPStatus_InvalidValue;
                     }
 
-                    CLIENT_DEBUG(context, "Updating characteristic %d.%d with Data:", aid, iid);
+                    CLIENT_INFO(context, "Updating characteristic %d.%d (\"%s\") with Data:", aid, iid, ch->description);
 
                     h_value = HOMEKIT_DATA(data, data_size);
-                    if (ch->setter_ex) {
-                        ch->setter_ex(ch, h_value);
-                    } else {
-                        homekit_value_destruct(&ch->value);
-                        homekit_value_copy(&ch->value, &h_value);
-                    }
 
                     break;
                 }
+                default: {
+                    CLIENT_ERROR(context, "Failed to update %d.%d: unknown characteristic format %d", aid, iid, ch->format);
+                    return HAPStatus_InvalidValue;
+                }
             }
 
-            if (!h_value.is_null) {
-                context->current_characteristic = ch;
-                context->current_value = &h_value;
-
-                homekit_characteristic_notify(ch, h_value);
-
-                context->current_characteristic = NULL;
-                context->current_value = NULL;
-            }
+            ch->setter_ex(ch, h_value);
+            homekit_characteristic_notify(ch, h_value);
         }
 
         cJSON *j_events = cJSON_GetObjectItem(j_ch, "ev");
@@ -2535,9 +3017,11 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
             }
 
             if (j_events->type == cJSON_True) {
-                homekit_characteristic_add_notify_callback(ch, client_notify_characteristic, context);
+                client_subscribe_to_characteristic_events(context, ch);
+                CLIENT_INFO(context, "Subscribed to notifications of characteristic %d.%d (\"%s\")", aid, iid, ch->description);
             } else {
-                homekit_characteristic_remove_notify_callback(ch, client_notify_characteristic, context);
+                client_unsubscribe_from_characteristic_events(context, ch);
+                CLIENT_INFO(context, "Unsubscribed from notifications of characteristic %d.%d (\"%s\")", aid, iid, ch->description);
             }
         }
 
@@ -2545,6 +3029,14 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
     }
 
     HAPStatus *statuses = malloc(sizeof(HAPStatus) * cJSON_GetArraySize(characteristics));
+    if (!statuses) {
+        CLIENT_ERROR(context, "Failed to allocate %d bytes for characteristic update statuses",
+                     sizeof(HAPStatus) * cJSON_GetArraySize(characteristics));
+
+        send_json_error_response(context, 500, HAPStatus_OutOfResources);
+        cJSON_Delete(json);
+        return;
+    }
     bool has_errors = false;
     for (int i=0; i < cJSON_GetArraySize(characteristics); i++) {
         cJSON *j_ch = cJSON_GetArrayItem(characteristics, i);
@@ -2564,10 +3056,13 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
 
         send_204_response(context);
     } else {
+        json_stream *json1 = &context->server->json;
+        json_set_context(json1, context);
+        json_reset(json1);
+
         CLIENT_DEBUG(context, "There were processing errors, sending Multi-Status response");
         client_send(context, json_207_response_headers, sizeof(json_207_response_headers)-1);
 
-        json_stream *json1 = json_new(1024, client_send_chunk, context);
         json_object_start(json1);
         json_string(json1, "characteristics"); json_array_start(json1);
 
@@ -2585,7 +3080,6 @@ void homekit_server_on_update_characteristics(client_context_t *context, const b
         json_object_end(json1); // response
 
         json_flush(json1);
-        json_free(json1);
 
         client_send_chunk(NULL, 0, context);
     }
@@ -2599,7 +3093,17 @@ void homekit_server_on_pairings(client_context_t *context, const byte *data, siz
     DEBUG_HEAP();
 
     tlv_values_t *message = tlv_new();
-    tlv_parse(data, size, message);
+    if (!message) {
+        CLIENT_ERROR(context, "Failed to allocate memory for TLV payload");
+        send_tlv_error_response(context, 2, TLVError_Unknown);
+        return;
+    }
+    if (tlv_parse(data, size, message)) {
+        CLIENT_ERROR(context, "Failed to parse TLV payload");
+        tlv_free(message);
+        send_tlv_error_response(context, 2, TLVError_Unknown);
+        return;
+    }
 
     TLV_DEBUG(message);
 
@@ -2651,73 +3155,71 @@ void homekit_server_on_pairings(client_context_t *context, const byte *data, siz
                 break;
             }
 
-            char *device_identifier = strndup(
-                (const char *)tlv_device_identifier->value,
-                tlv_device_identifier->size
-            );
-
             pairing_t pairing;
-            if (!homekit_storage_find_pairing(device_identifier, &pairing)) {
+            if (!homekit_storage_find_pairing((const char *)tlv_device_identifier->value, &pairing)) {
                 size_t pairing_public_key_size = 0;
                 crypto_ed25519_export_public_key(&pairing.device_key, NULL, &pairing_public_key_size);
 
                 byte *pairing_public_key = malloc(pairing_public_key_size);
+                if (!pairing_public_key) {
+                    CLIENT_ERROR(context, "Failed to allocate %d bytes for pairing public key",
+                                 pairing_public_key_size);
+                    send_tlv_error_response(context, 2, TLVError_Unknown);
+                    break;
+                }
+
                 r = crypto_ed25519_export_public_key(&pairing.device_key, pairing_public_key, &pairing_public_key_size);
                 if (r) {
                     CLIENT_ERROR(context, "Failed to add pairing: error exporting pairing public key (code %d)", r);
                     free(pairing_public_key);
-                    free(device_identifier);
                     send_tlv_error_response(context, 2, TLVError_Unknown);
+                    break;
                 }
 
                 if (pairing_public_key_size != tlv_device_public_key->size ||
                         memcmp(tlv_device_public_key->value, pairing_public_key, pairing_public_key_size)) {
                     CLIENT_ERROR(context, "Failed to add pairing: pairing public key differs from given one");
                     free(pairing_public_key);
-                    free(device_identifier);
-                    send_tlv_error_response(context, 2, TLVError_Unknown);
-                }
-
-                free(pairing_public_key);
-
-                r = homekit_storage_update_pairing(device_identifier, device_permissions);
-                if (r) {
-                    CLIENT_ERROR(context, "Failed to add pairing: storage error (code %d)", r);
-                    free(device_identifier);
                     send_tlv_error_response(context, 2, TLVError_Unknown);
                     break;
                 }
 
-                INFO("Updated pairing with %s", device_identifier);
+                free(pairing_public_key);
+
+                r = homekit_storage_update_pairing((const char *)tlv_device_identifier->value, device_permissions);
+                if (r) {
+                    CLIENT_ERROR(context, "Failed to add pairing: storage error (code %d)", r);
+                    send_tlv_error_response(context, 2, TLVError_Unknown);
+                    break;
+                }
+
+                INFO("Updated pairing with %.*s", tlv_device_identifier->size, tlv_device_identifier->value);
             } else {
                 if (!homekit_storage_can_add_pairing()) {
                     CLIENT_ERROR(context, "Failed to add pairing: max peers");
-                    free(device_identifier);
                     send_tlv_error_response(context, 2, TLVError_MaxPeers);
                     break;
                 }
 
                 r = homekit_storage_add_pairing(
-                    device_identifier, &device_key, device_permissions
+                    (const char *)tlv_device_identifier->value, &device_key, device_permissions
                 );
                 if (r) {
                     CLIENT_ERROR(context, "Failed to add pairing: storage error (code %d)", r);
-                    free(device_identifier);
                     send_tlv_error_response(context, 2, TLVError_Unknown);
                     break;
                 }
 
-                INFO("Added pairing with %s", device_identifier);
+                INFO("Added pairing with %.*s", tlv_device_identifier->size, tlv_device_identifier->value);
 
                 HOMEKIT_NOTIFY_EVENT(context->server, HOMEKIT_EVENT_PAIRING_ADDED);
             }
 
-            free(device_identifier);
+            tlv_stream_t *tlv = client_start_tlv_response(context);
 
-            tlv_values_t *response = tlv_new();
-            tlv_add_integer_value(response, TLVType_State, 1, 2);
+            tlv_stream_add_integer_value(tlv, TLVType_State, 1, 2);
 
-            send_tlv_response(context, response);
+            client_finish_tlv_response(context);
 
             break;
         }
@@ -2737,24 +3239,18 @@ void homekit_server_on_pairings(client_context_t *context, const byte *data, siz
                 break;
             }
 
-            char *device_identifier = strndup(
-                (const char *)tlv_device_identifier->value,
-                tlv_device_identifier->size
-            );
-
             pairing_t pairing;
-            if (!homekit_storage_find_pairing(device_identifier, &pairing)) {
+            if (!homekit_storage_find_pairing((const char *)tlv_device_identifier->value, &pairing)) {
                 bool is_admin = pairing.permissions & pairing_permissions_admin;
 
-                r = homekit_storage_remove_pairing(device_identifier);
+                r = homekit_storage_remove_pairing((const char *)tlv_device_identifier->value);
                 if (r) {
                     CLIENT_ERROR(context, "Failed to remove pairing: storage error (code %d)", r);
-                    free(device_identifier);
                     send_tlv_error_response(context, 2, TLVError_Unknown);
                     break;
                 }
 
-                INFO("Removed pairing with %s", device_identifier);
+                INFO("Removed pairing with %.*s", tlv_device_identifier->size, tlv_device_identifier->value);
 
                 HOMEKIT_NOTIFY_EVENT(context->server, HOMEKIT_EVENT_PAIRING_REMOVED);
 
@@ -2791,12 +3287,12 @@ void homekit_server_on_pairings(client_context_t *context, const byte *data, siz
                 }
             }
 
-            free(device_identifier);
+            tlv_stream_t *tlv = client_start_tlv_response(context);
 
-            tlv_values_t *response = tlv_new();
-            tlv_add_integer_value(response, TLVType_State, 1, 2);
+            tlv_stream_add_integer_value(tlv, TLVType_State, 1, 2);
 
-            send_tlv_response(context, response);
+            client_finish_tlv_response(context);
+
             break;
         }
         case TLVMethod_ListPairings: {
@@ -2808,8 +3304,9 @@ void homekit_server_on_pairings(client_context_t *context, const byte *data, siz
                 break;
             }
 
-            tlv_values_t *response = tlv_new();
-            tlv_add_integer_value(response, TLVType_State, 1, 2);
+            tlv_stream_t *tlv = client_start_tlv_response(context);
+
+            tlv_stream_add_integer_value(tlv, TLVType_State, 1, 2);
 
             bool first = true;
 
@@ -2822,20 +3319,21 @@ void homekit_server_on_pairings(client_context_t *context, const byte *data, siz
 
             while (!homekit_storage_next_pairing(&it, &pairing)) {
                 if (!first) {
-                    tlv_add_value(response, TLVType_Separator, NULL, 0);
+                    tlv_stream_add_value(tlv, TLVType_Separator, NULL, 0);
                 }
                 size_t public_key_size = sizeof(public_key);
                 r = crypto_ed25519_export_public_key(&pairing.device_key, public_key, &public_key_size);
 
-                tlv_add_string_value(response, TLVType_Identifier, pairing.device_id);
-                tlv_add_value(response, TLVType_PublicKey, public_key, public_key_size);
-                tlv_add_integer_value(response, TLVType_Permissions, 1, pairing.permissions);
+                tlv_stream_add_string_value(tlv, TLVType_Identifier, pairing.device_id);
+                tlv_stream_add_value(tlv, TLVType_PublicKey, public_key, public_key_size);
+                tlv_stream_add_integer_value(tlv, TLVType_Permissions, 1, pairing.permissions);
 
                 first = false;
             }
             homekit_storage_pairing_iterator_done(&it);
 
-            send_tlv_response(context, response);
+            client_finish_tlv_response(context);
+
             break;
         }
         default: {
@@ -2847,17 +3345,6 @@ void homekit_server_on_pairings(client_context_t *context, const byte *data, siz
     tlv_free(message);
 }
 
-void homekit_server_on_reset(client_context_t *context) {
-    INFO("Reset");
-
-    homekit_server_reset();
-    send_204_response(context);
-
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
-
-    homekit_system_restart();
-}
-
 void homekit_server_on_resource(client_context_t *context) {
     CLIENT_INFO(context, "Resource");
     DEBUG_HEAP();
@@ -2867,17 +3354,17 @@ void homekit_server_on_resource(client_context_t *context) {
         return;
     }
 
-    context->server->config->on_resource(context->body, context->body_length);
+    context->server->config->on_resource(context->server->body, context->server->body_length);
 }
 
 
 int homekit_server_on_url(http_parser *parser, const char *data, size_t length) {
     client_context_t *context = (client_context_t*) parser->data;
 
-    context->endpoint = HOMEKIT_ENDPOINT_UNKNOWN;
+    context->server->endpoint = HOMEKIT_ENDPOINT_UNKNOWN;
     if (parser->method == HTTP_GET) {
         if (!strncmp(data, "/accessories", length)) {
-            context->endpoint = HOMEKIT_ENDPOINT_GET_ACCESSORIES;
+            context->server->endpoint = HOMEKIT_ENDPOINT_GET_ACCESSORIES;
         } else {
             static const char url[] = "/characteristics";
             size_t url_len = sizeof(url)-1;
@@ -2885,36 +3372,107 @@ int homekit_server_on_url(http_parser *parser, const char *data, size_t length) 
             if (length >= url_len && !strncmp(data, url, url_len) &&
                     (data[url_len] == 0 || data[url_len] == '?'))
             {
-                context->endpoint = HOMEKIT_ENDPOINT_GET_CHARACTERISTICS;
+                context->server->endpoint = HOMEKIT_ENDPOINT_GET_CHARACTERISTICS;
                 if (data[url_len] == '?') {
-                    char *query = strndup(data+url_len+1, length-url_len-1);
-                    context->endpoint_params = query_params_parse(query);
-                    free(query);
+                    homekit_server_t *server = context->server;
+                    memset(server->endpoint_params.ids, 0, sizeof(server->endpoint_params.ids));
+                    server->endpoint_params.format = 0;
+                    uint16_t id_count = 0;
+
+                    query_param_iterator_t it;
+                    query_param_iterator_init(&it, data+url_len+1, length-url_len-1);
+
+                    query_param_t param;
+                    while (query_param_iterator_next(&it, &param)) {
+                        if (!strncmp(param.name, "id", param.name_len)) {
+                            int pos = 0;
+
+                            while (pos < param.value_len) {
+                                if (pos >= param.value_len || !isdigit((unsigned char)param.value[pos])) {
+                                    CLIENT_ERROR(context, "Unexpected character in ID query param at position %d: "
+                                                 "expected digit, actual '%c'", pos, param.value[pos]);
+                                    break;
+                                }
+
+                                uint16_t aid = 0;
+
+                                while (pos < param.value_len && isdigit((unsigned char)param.value[pos])) {
+                                    aid = aid * 10 + param.value[pos++] - '0';
+                                }
+
+                                if (pos >= param.value_len || param.value[pos] != '.') {
+                                    CLIENT_ERROR(context, "Unexpected character in ID query param at position %d: "
+                                                 "expected '.', actual '%c'", pos, param.value[pos]);
+                                    break;
+                                }
+
+                                pos++;
+
+                                if (pos >= param.value_len || !isdigit((unsigned char)param.value[pos])) {
+                                    CLIENT_ERROR(context, "Unexpected character in ID query param at position %d: "
+                                                 "expected digit, actual '%c'", pos, param.value[pos]);
+                                    break;
+                                }
+
+                                uint16_t iid = 0;
+                                while (pos < param.value_len && isdigit((unsigned char)param.value[pos])) {
+                                    iid = iid * 10 + param.value[pos++] - '0';
+                                }
+
+                                server->endpoint_params.ids[id_count].aid = aid;
+                                server->endpoint_params.ids[id_count].iid = iid;
+                                id_count++;
+
+                                if (pos >= param.value_len)
+                                    break;
+
+                                if (param.value[pos] != ',') {
+                                    CLIENT_ERROR(context, "Unexpected character in ID query param at position %d: "
+                                                 "expected ',', actual '%c'", pos, param.value[pos]);
+                                    break;
+                                }
+
+                                pos++;
+                            }
+                        } else if (!strncmp(param.name, "meta", param.name_len)) {
+                            if (param.value && param.value_len == 1 && param.value[0] == '1')
+                                server->endpoint_params.format |= characteristic_format_meta;
+                        } else if (!strncmp(param.name, "perms", param.name_len)) {
+                            if (param.value && param.value_len == 1 && param.value[0] == '1')
+                                server->endpoint_params.format |= characteristic_format_perms;
+                        } else if (!strncmp(param.name, "type", param.name_len)) {
+                            if (param.value && param.value_len == 1 && param.value[0] == '1')
+                                server->endpoint_params.format |= characteristic_format_type;
+                        } else if (!strncmp(param.name, "ev", param.name_len)) {
+                            if (param.value && param.value_len == 1 && param.value[0] == '1')
+                                server->endpoint_params.format |= characteristic_format_events;
+                        }
+                    }
+
+                    query_param_iterator_done(&it);
                 }
             }
         }
     } else if (parser->method == HTTP_POST) {
         if (!strncmp(data, "/identify", length)) {
-            context->endpoint = HOMEKIT_ENDPOINT_IDENTIFY;
+            context->server->endpoint = HOMEKIT_ENDPOINT_IDENTIFY;
         } else if (!strncmp(data, "/pair-setup", length)) {
-            context->endpoint = HOMEKIT_ENDPOINT_PAIR_SETUP;
+            context->server->endpoint = HOMEKIT_ENDPOINT_PAIR_SETUP;
         } else if (!strncmp(data, "/pair-verify", length)) {
-            context->endpoint = HOMEKIT_ENDPOINT_PAIR_VERIFY;
+            context->server->endpoint = HOMEKIT_ENDPOINT_PAIR_VERIFY;
         } else if (!strncmp(data, "/pairings", length)) {
-            context->endpoint = HOMEKIT_ENDPOINT_PAIRINGS;
+            context->server->endpoint = HOMEKIT_ENDPOINT_PAIRINGS;
         } else if (!strncmp(data, "/resource", length)) {
-            context->endpoint = HOMEKIT_ENDPOINT_RESOURCE;
+            context->server->endpoint = HOMEKIT_ENDPOINT_RESOURCE;
         }
     } else if (parser->method == HTTP_PUT) {
         if (!strncmp(data, "/characteristics", length)) {
-            context->endpoint = HOMEKIT_ENDPOINT_UPDATE_CHARACTERISTICS;
+            context->server->endpoint = HOMEKIT_ENDPOINT_UPDATE_CHARACTERISTICS;
         }
     }
 
-    if (context->endpoint == HOMEKIT_ENDPOINT_UNKNOWN) {
-        char *url = strndup(data, length);
-        ERROR("Unknown endpoint: %s %s", http_method_str(parser->method), url);
-        free(url);
+    if (context->server->endpoint == HOMEKIT_ENDPOINT_UNKNOWN) {
+        ERROR("Unknown endpoint: %s %.*s", http_method_str(parser->method), length, data);
     }
 
     return 0;
@@ -2922,10 +3480,27 @@ int homekit_server_on_url(http_parser *parser, const char *data, size_t length) 
 
 int homekit_server_on_body(http_parser *parser, const char *data, size_t length) {
     client_context_t *context = parser->data;
-    context->body = realloc(context->body, context->body_length + length + 1);
-    memcpy(context->body + context->body_length, data, length);
-    context->body_length += length;
-    context->body[context->body_length] = 0;
+    if (!context->server->body && !parser->content_length) {
+        context->server->body = (char *)data;
+        context->server->body_length = length;
+        context->server->body_static = true;
+    } else {
+        if (!context->server->body) {
+            context->server->body = malloc(length + parser->content_length + 1);
+            context->server->body_length = 0;
+            context->server->body_static = false;
+        }
+        memcpy(context->server->body + context->server->body_length, data, length);
+        context->server->body_length += length;
+        context->server->body[context->server->body_length] = 0;
+    }
+
+    return 0;
+}
+
+int homekit_server_on_message_begin(http_parser *parser) {
+    client_context_t *context = parser->data;
+    context->server->request_completed = false;
 
     return 0;
 }
@@ -2934,13 +3509,13 @@ int homekit_server_on_message_complete(http_parser *parser) {
     client_context_t *context = parser->data;
 
     if (!context->encrypted) {
-        switch(context->endpoint) {
+        switch(context->server->endpoint) {
             case HOMEKIT_ENDPOINT_PAIR_SETUP: {
-                homekit_server_on_pair_setup(context, (const byte *)context->body, context->body_length);
+                homekit_server_on_pair_setup(context, (const byte *)context->server->body, context->server->body_length);
                 break;
             }
             case HOMEKIT_ENDPOINT_PAIR_VERIFY: {
-                homekit_server_on_pair_verify(context, (const byte *)context->body, context->body_length);
+                homekit_server_on_pair_verify(context, (const byte *)context->server->body, context->server->body_length);
                 break;
             }
             default: {
@@ -2950,7 +3525,7 @@ int homekit_server_on_message_complete(http_parser *parser) {
             }
         }
     } else {
-        switch(context->endpoint) {
+        switch(context->server->endpoint) {
             case HOMEKIT_ENDPOINT_IDENTIFY: {
                 homekit_server_on_identify(context);
                 break;
@@ -2964,11 +3539,11 @@ int homekit_server_on_message_complete(http_parser *parser) {
                 break;
             }
             case HOMEKIT_ENDPOINT_UPDATE_CHARACTERISTICS: {
-                homekit_server_on_update_characteristics(context, (const byte *)context->body, context->body_length);
+                homekit_server_on_update_characteristics(context, (const byte *)context->server->body, context->server->body_length);
                 break;
             }
             case HOMEKIT_ENDPOINT_PAIRINGS: {
-                homekit_server_on_pairings(context, (const byte *)context->body, context->body_length);
+                homekit_server_on_pairings(context, (const byte *)context->server->body, context->server->body_length);
                 break;
             }
             case HOMEKIT_ENDPOINT_RESOURCE: {
@@ -2983,16 +3558,15 @@ int homekit_server_on_message_complete(http_parser *parser) {
         }
     }
 
-    if (context->endpoint_params) {
-        query_params_free(context->endpoint_params);
-        context->endpoint_params = NULL;
+    if (context->server->body) {
+        if (!context->server->body_static)
+            free(context->server->body);
+        context->server->body = NULL;
+        context->server->body_length = 0;
+        context->server->body_static = false;
     }
 
-    if (context->body) {
-        free(context->body);
-        context->body = NULL;
-        context->body_length = 0;
-    }
+    context->server->request_completed = true;
 
     return 0;
 }
@@ -3001,84 +3575,99 @@ int homekit_server_on_message_complete(http_parser *parser) {
 static http_parser_settings homekit_http_parser_settings = {
     .on_url = homekit_server_on_url,
     .on_body = homekit_server_on_body,
+    .on_message_begin = homekit_server_on_message_begin,
     .on_message_complete = homekit_server_on_message_complete,
 };
 
 
 static void homekit_client_process(client_context_t *context) {
-    int data_len = read(
-        context->socket,
-        context->data+context->data_available,
-        context->data_size-context->data_available
-    );
-    if (data_len == 0) {
-        context->disconnect = true;
-        return;
-    }
+    context->server->parser.data = context;
 
-    if (data_len < 0) {
-        if (errno != EAGAIN) {
-            CLIENT_ERROR(context, "Error reading data from socket (code %d). Disconnecting", errno);
+    size_t data_available = 0;
+
+    do {
+        int data_len = read(
+            context->socket,
+            context->server->data+data_available,
+            sizeof(context->server->data)-data_available
+        );
+        if (data_len == 0) {
             context->disconnect = true;
-        }
-        return;
-    }
-
-    CLIENT_DEBUG(context, "Got %d incomming data", data_len);
-    byte *payload = (byte *)context->data;
-    size_t payload_size = (size_t)data_len;
-
-    byte *decrypted = NULL;
-    size_t decrypted_size = 0;
-
-    if (context->encrypted) {
-        CLIENT_DEBUG(context, "Decrypting data");
-
-        client_decrypt(context, context->data, data_len, NULL, &decrypted_size);
-
-        decrypted = malloc(decrypted_size);
-        int r = client_decrypt(context, context->data, data_len, decrypted, &decrypted_size);
-        if (r < 0) {
-            CLIENT_ERROR(context, "Invalid client data");
-            free(decrypted);
             return;
         }
-        context->data_available = data_len - r;
-        if (r && context->data_available) {
-            memmove(context->data, &context->data[r], context->data_available);
+
+        if (data_len < 0) {
+            if (errno != EAGAIN) {
+                CLIENT_ERROR(context, "Error reading data from socket (code %d). Disconnecting", errno);
+                context->disconnect = true;
+                return;
+            }
+            continue;
         }
-        CLIENT_DEBUG(context, "Decrypted %d bytes, available %d", decrypted_size, context->data_available);
 
-        payload = decrypted;
-        payload_size = decrypted_size;
-        if (payload_size)
-            print_binary("Decrypted data", payload, payload_size);
-    } else {
-        context->data_available = 0;
-    }
+        CLIENT_DEBUG(context, "Got %d incoming data", data_len);
+        byte *payload = (byte *)context->server->data;
+        size_t payload_size = (size_t)data_len;
 
-    current_client_context = context;
+        size_t decrypted_size = sizeof(context->server->data) - 2 - 18;
 
-    http_parser_execute(
-        &context->parser, &homekit_http_parser_settings,
-        (char *)payload, payload_size
-    );
+        if (context->encrypted) {
+            CLIENT_DEBUG(context, "Decrypting data");
+
+            int r = client_decrypt(context, context->server->data, data_len, context->server->data+2, &decrypted_size);
+            if (r < 0) {
+                CLIENT_ERROR(context, "Invalid client data");
+                return;
+            }
+            data_available = data_len - r;
+            if (r && data_available) {
+                memmove(context->server->data, &context->server->data[r], data_available);
+            }
+            CLIENT_DEBUG(context, "Decrypted %d bytes, available %d", decrypted_size, data_available);
+
+            payload = context->server->data+2;
+            payload_size = decrypted_size;
+            if (payload_size)
+                print_binary("Decrypted data", payload, payload_size);
+        } else {
+            data_available = 0;
+        }
+
+        current_client_context = context;
+
+        context->server->request_completed = false;
+
+        http_parser_execute(
+            &context->server->parser, &homekit_http_parser_settings,
+            (char *)payload, payload_size
+        );
+    } while (data_available && !context->server->request_completed);
 
     current_client_context = NULL;
+    context->server->parser.data = NULL;
 
     CLIENT_DEBUG(context, "Finished processing");
-
-    if (decrypted) {
-        free(decrypted);
-    }
 }
 
 
 void homekit_server_close_client(homekit_server_t *server, client_context_t *context) {
-    CLIENT_INFO(context, "Closing client connection");
+    char address_buffer[INET_ADDRSTRLEN];
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    if (getpeername(context->socket, (struct sockaddr *)&addr, &addr_len) == 0) {
+        inet_ntop(AF_INET, &addr.sin_addr, address_buffer, sizeof(address_buffer));
+    } else {
+        strcpy(address_buffer, "?.?.?.?");
+    }
+    CLIENT_INFO(context, "Closing client connection from %s",address_buffer);
 
     FD_CLR(context->socket, &server->fds);
     server->client_count--;
+
+    bitset_clear(server->client_ids, context->id);
+    for (uint16_t nid=0; nid < server->notify_count; nid++) {
+        bitset_clear(server->subscriptions, nid * HOMEKIT_MAX_CLIENTS + context->id);
+    }
 
     close(context->socket);
 
@@ -3086,12 +3675,6 @@ void homekit_server_close_client(homekit_server_t *server, client_context_t *con
         pairing_context_free(server->pairing_context);
         server->pairing_context = NULL;
     }
-
-    homekit_accessories_clear_notify_callbacks(
-        server->config->accessories,
-        client_notify_characteristic,
-        context
-    );
 
     HOMEKIT_NOTIFY_EVENT(server, HOMEKIT_EVENT_CLIENT_DISCONNECTED);
 
@@ -3101,26 +3684,19 @@ void homekit_server_close_client(homekit_server_t *server, client_context_t *con
 
 client_context_t *homekit_server_accept_client(homekit_server_t *server) {
     int s = accept(server->listen_fd, (struct sockaddr *)NULL, (socklen_t *)NULL);
-    if (s < 0)
+    if (s < 0) {
+        if (errno == EWOULDBLOCK)
+            return NULL;
+
+        ERROR("Failed to accept connection (errno %d)", errno);
         return NULL;
+    }
 
     if (server->client_count >= HOMEKIT_MAX_CLIENTS) {
         INFO("No more room for client connections (max %d)", HOMEKIT_MAX_CLIENTS);
         close(s);
         return NULL;
     }
-
-    char address_buffer[INET_ADDRSTRLEN];
-
-    struct sockaddr_in addr;
-    socklen_t addr_len = sizeof(addr);
-    if (getpeername(s, (struct sockaddr *)&addr, &addr_len) == 0) {
-        inet_ntop(AF_INET, &addr.sin_addr, address_buffer, sizeof(address_buffer));
-    } else {
-        strcpy(address_buffer, "?.?.?.?");
-    }
-
-    INFO("Got new client connection: %d from %s", s, address_buffer);
 
     const struct timeval rcvtimeout = { 10, 0 }; /* 10 second timeout */
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &rcvtimeout, sizeof(rcvtimeout));
@@ -3138,16 +3714,62 @@ client_context_t *homekit_server_accept_client(homekit_server_t *server) {
     setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &maxpkt, sizeof(maxpkt));
 
     client_context_t *context = client_context_new();
+    if (!context) {
+        ERROR("Failed to allocate memory for client context");
+        close(s);
+        return NULL;
+    }
     context->server = server;
+    context->id = HOMEKIT_MAX_CLIENTS;
+    // find available client ID
+    for (uint8_t id=0; id < HOMEKIT_MAX_CLIENTS; id++) {
+        if (!bitset_isset(server->client_ids, id)) {
+            bitset_set(server->client_ids, id);
+            context->id = id;
+            break;
+        }
+    }
+    if (context->id == HOMEKIT_MAX_CLIENTS) {
+        ERROR("Failed to assign ID for client context");
+        client_context_free(context);
+        close(s);
+        return NULL;
+    }
+
     context->socket = s;
     context->next = server->clients;
-
-    server->clients = context;
 
     FD_SET(s, &server->fds);
     server->client_count++;
     if (s > server->max_fd)
         server->max_fd = s;
+    DEBUG_HEAP();
+
+    char address_buffer[INET_ADDRSTRLEN];
+
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    if (getpeername(s, (struct sockaddr *)&addr, &addr_len) == 0) {
+        inet_ntop(AF_INET, &addr.sin_addr, address_buffer, sizeof(address_buffer));
+    } else {
+        strcpy(address_buffer, "?.?.?.?");
+    }
+
+    CLIENT_INFO(context, "Got new client connection from %s", address_buffer);
+
+
+    client_context_t *c = server->clients;
+    while (c) {
+        if (getpeername(c->socket, (struct sockaddr *)&addr, &addr_len) == 0) {
+            inet_ntop(AF_INET, &addr.sin_addr, address_buffer, sizeof(address_buffer));
+        } else {
+            strcpy(address_buffer, "?.?.?.?");
+        }
+        CLIENT_INFO(c, " Have existing connection from %s %s", address_buffer, c->disconnect?"X":"");
+        c = c->next;
+    }
+
+    server->clients = context;
 
     HOMEKIT_NOTIFY_EVENT(server, HOMEKIT_EVENT_CLIENT_CONNECTED);
 
@@ -3155,75 +3777,110 @@ client_context_t *homekit_server_accept_client(homekit_server_t *server) {
 }
 
 
-client_context_t *homekit_server_find_client_by_fd(homekit_server_t *server, int fd) {
-    client_context_t *context = server->clients;
-    while (context) {
-        if (context->socket == fd)
-            return context;
-        context = context->next;
+void homekit_characteristic_notify(homekit_characteristic_t *ch, homekit_value_t value) {
+    if (!server)
+        return;
+
+    if (!(ch->permissions & homekit_permissions_notify))
+        return;
+
+    xSemaphoreTake(server->notification_lock, portMAX_DELAY);
+
+    characteristic_info_t *ch_info = find_characteristic_info_by_characteristic(server, ch);
+    if (!ch_info) {
+        ERROR("Trying notify on unknown characteristic \"%s\"", ch->description);
+        return;
     }
 
-    return NULL;
+    DEBUG("Got characteristic %d.%d change event", ch_info->aid, ch_info->iid);
+
+    homekit_value_destruct(&server->notifications[ch_info->notification_id].value);
+    homekit_value_copy(&server->notifications[ch_info->notification_id].value, &value);
+
+    bitset_set(server->has_notification, ch_info->notification_id);
+    server->has_notifications = true;
+
+    xSemaphoreGive(server->notification_lock);
+
+    // backward compatibility
+    homekit_characteristic_change_callback_t *callback = ch->callback;
+    while (callback) {
+        callback->function(ch, value, callback->context);
+        callback = callback->next;
+    }
 }
 
 
 void homekit_server_process_notifications(homekit_server_t *server) {
+    if (!server->has_notifications)
+        return;
+
+    xSemaphoreTake(server->notification_lock, portMAX_DELAY);
+
     client_context_t *context = server->clients;
     while (context) {
-        characteristic_event_t *event = NULL;
-        if (xQueueReceive(context->event_queue, &event, 0)) {
-            // Get and coalesce all client events
-            client_event_t *events_head = malloc(sizeof(client_event_t));
-            events_head->characteristic = event->characteristic;
-            homekit_value_copy(&events_head->value, &event->value);
-            events_head->next = NULL;
+        bool first = true;
 
-            homekit_value_destruct(&event->value);
-            free(event);
+        json_stream *json = &context->server->json;
+        json_set_context(json, context);
+        json_reset(json);
 
-            client_event_t *events_tail = events_head;
+        for (uint16_t nid=0; nid < server->notify_count; nid++) {
+            if (!bitset_isset(server->has_notification, nid))
+                continue;
 
-            while (xQueueReceive(context->event_queue, &event, 0)) {
-                client_event_t *e = events_head;
-                while (e) {
-                    if (e->characteristic == event->characteristic)
-                        break;
+            characteristic_info_t *ch_info = find_characteristic_info_by_characteristic(server, server->notifications[nid].ch);
 
-                    e = e->next;
-                }
-
-                if (e) {
-                    homekit_value_destruct(&e->value);
-                } else {
-                    e = malloc(sizeof(client_event_t));
-                    e->characteristic = event->characteristic;
-                    e->next = NULL;
-
-                    events_tail->next = e;
-                    events_tail = e;
-                }
-
-                homekit_value_copy(&e->value, &event->value);
-
-                homekit_value_destruct(&event->value);
-                free(event);
+            if (!bitset_isset(server->subscriptions, nid * HOMEKIT_MAX_CLIENTS + context->id)) {
+                CLIENT_DEBUG(context, "Not subscribed to characteristic %d.%d, skipping event", ch_info->aid, ch_info->iid);
+                continue;
             }
 
-            send_client_events(context, events_head);
+            if (first) {
+                CLIENT_DEBUG(context, "Sending EVENT");
+                DEBUG_HEAP();
 
-            client_event_t *e = events_head;
-            while (e) {
-                client_event_t *next = e->next;
+                static byte http_headers[] =
+                    "EVENT/1.0 200 OK\r\n"
+                    "Content-Type: application/hap+json\r\n"
+                    "Transfer-Encoding: chunked\r\n\r\n";
 
-                homekit_value_destruct(&e->value);
-                free(e);
+                client_send(context, http_headers, sizeof(http_headers)-1);
 
-                e = next;
+                json_object_start(json);
+                json_string(json, "characteristics"); json_array_start(json);
+
+                first = false;
             }
+
+            json_object_start(json);
+            write_characteristic_json(json, context, ch_info->ch, 0, &server->notifications[nid].value);
+            json_object_end(json);
+        }
+
+        if (!first) {
+            json_array_end(json);
+            json_object_end(json);
+
+            json_flush(json);
+
+            client_send_chunk(NULL, 0, context);
         }
 
         context = context->next;
     }
+
+    for (uint16_t nid=0; nid < server->notify_count; nid++) {
+        if (!bitset_isset(server->has_notification, nid))
+            continue;
+
+        homekit_value_destruct(&server->notifications[nid].value);
+    }
+
+    bitset_clear_all(server->has_notification);
+    server->has_notifications = false;
+
+    xSemaphoreGive(server->notification_lock);
 }
 
 
@@ -3255,15 +3912,33 @@ void homekit_server_close_clients(homekit_server_t *server) {
 
 static void homekit_run_server(homekit_server_t *server)
 {
-    DEBUG("Staring HTTP server");
+    DEBUG("Starting HTTP server");
 
     struct sockaddr_in serv_addr;
     server->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server->listen_fd < 0) {
+        ERROR("Failed to create server socket (errno %d)", errno);
+        return;
+    }
     memset(&serv_addr, '0', sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     serv_addr.sin_port = htons(PORT);
     bind(server->listen_fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+
+    int opt = lwip_fcntl(server->listen_fd, F_GETFL, 0);
+    if (opt < 0) {
+        ERROR("Failed to read configuration to server socket (errno %d)", errno);
+        close(server->listen_fd);
+        return;
+    }
+    opt |= O_NONBLOCK;
+    if (lwip_fcntl(server->listen_fd, F_SETFL, opt) == -1) {
+        ERROR("Failed to write configuration to server socket (errno %d)", errno);
+        close(server->listen_fd);
+        return;
+    }
+
     listen(server->listen_fd, 10);
 
     FD_SET(server->listen_fd, &server->fds);
@@ -3277,12 +3952,19 @@ static void homekit_run_server(homekit_server_t *server)
         struct timeval timeout = { 1, 0 }; /* 1 second timeout */
         int triggered_nfds = select(server->max_fd + 1, &read_fds, NULL, NULL, &timeout);
         if (triggered_nfds > 0) {
+            client_context_t *context = NULL;
             if (FD_ISSET(server->listen_fd, &read_fds)) {
-                homekit_server_accept_client(server);
+                while (true) {
+                    context = homekit_server_accept_client(server);
+                    if (!context)
+                        break;
+
+                    homekit_client_process(context);
+                }
                 triggered_nfds--;
             }
 
-            client_context_t *context = server->clients;
+            context = server->clients;
             while (context && triggered_nfds) {
                 if (FD_ISSET(context->socket, &read_fds)) {
                     homekit_client_process(context);
@@ -3339,7 +4021,7 @@ void homekit_setup_mdns(homekit_server_t *server) {
     // should be in format XX:XX:XX:XX:XX:XX, otherwise devices will ignore it
     homekit_mdns_add_txt("id", "%s", server->accessory_id);
     // current configuration number (required)
-    homekit_mdns_add_txt("c#", "%d", server->config->config_number);
+    homekit_mdns_add_txt("c#", "%u", server->config->config_number);
     // current state number (required)
     homekit_mdns_add_txt("s#", "1");
     // feature flags (required if non-zero)
@@ -3360,21 +4042,25 @@ void homekit_setup_mdns(homekit_server_t *server) {
 
         size_t data_size = strlen(server->config->setupId) + strlen(server->accessory_id) + 1;
         char *data = malloc(data_size);
-        snprintf(data, data_size, "%s%s", server->config->setupId, server->accessory_id);
-        data[data_size-1] = 0;
+        if (!data) {
+            ERROR("Failed to allocate %d bytes for generating setup ID hash", data_size);
+        } else {
+            snprintf(data, data_size, "%s%s", server->config->setupId, server->accessory_id);
+            data[data_size-1] = 0;
 
-        unsigned char shaHash[SHA512_DIGEST_SIZE];
-        wc_Sha512Hash((const unsigned char *)data, data_size-1, shaHash);
+            unsigned char shaHash[SHA512_DIGEST_SIZE];
+            wc_Sha512Hash((const unsigned char *)data, data_size-1, shaHash);
 
-        free(data);
+            free(data);
 
-        unsigned char encodedHash[9];
-        memset(encodedHash, 0, sizeof(encodedHash));
+            unsigned char encodedHash[9];
+            memset(encodedHash, 0, sizeof(encodedHash));
 
-        word32 len = sizeof(encodedHash);
-        Base64_Encode_NoNl((const unsigned char *)shaHash, 4, encodedHash, &len);
+            word32 len = sizeof(encodedHash);
+            Base64_Encode_NoNl((const unsigned char *)shaHash, 4, encodedHash, &len);
 
-        homekit_mdns_add_txt("sh", "%s", encodedHash);
+            homekit_mdns_add_txt("sh", "%s", encodedHash);
+        }
     }
 
     homekit_mdns_configure_finalize();
@@ -3457,6 +4143,151 @@ void homekit_server_task(void *args) {
 #define ISDIGIT(x) isdigit((unsigned char)(x))
 #define ISBASE36(x) (isdigit((unsigned char)(x)) || (x >= 'A' && x <= 'Z'))
 
+
+int accessory_info_cmp_accessory(const accessory_info_t *a, const accessory_info_t *b) {
+    return (a->accessory == b->accessory) ? 0 : ((a->accessory < b->accessory) ? -1 : 1);
+}
+
+
+int service_info_cmp_service(const service_info_t *a, const service_info_t *b) {
+    return (a->service == b->service) ? 0 : ((a->service < b->service) ? -1 : 1);
+}
+
+
+int characteristic_info_cmp_characteristic(const characteristic_info_t *a, const characteristic_info_t *b) {
+    return (a->ch == b->ch) ? 0 : ((a->ch < b->ch) ? -1 : 1);
+}
+
+
+int homekit_accessories_init(homekit_server_t *server) {
+    server->accessory_count = 0;
+    server->service_count = 0;
+    server->characteristic_count = 0;
+    server->notify_count = 0;
+
+    for (homekit_accessory_t **accessory_it = server->config->accessories; *accessory_it; accessory_it++) {
+        server->accessory_count++;
+        for (homekit_service_t **service_it = (*accessory_it)->services; *service_it; service_it++) {
+            server->service_count++;
+            for (homekit_characteristic_t **ch_it = (*service_it)->characteristics; *ch_it; ch_it++) {
+                homekit_characteristic_t *ch = *ch_it;
+                server->characteristic_count++;
+
+                if (ch->permissions & homekit_permissions_notify) {
+                    server->notify_count++;
+                }
+            }
+        }
+    }
+
+    server->accessory_infos = calloc(server->accessory_count, sizeof(accessory_info_t));
+    if (!server->accessory_infos) {
+        ERROR("Error initializing HomeKit accessory server: "
+              "failed to allocate memory for accessory infos");
+        return -1;
+    }
+    server->service_infos = calloc(server->service_count, sizeof(service_info_t));
+    if (!server->service_infos) {
+        ERROR("Error initializing HomeKit accessory server: "
+              "failed to allocate memory for service infos");
+        return -1;
+    }
+    server->characteristic_infos = calloc(server->characteristic_count, sizeof(characteristic_info_t));
+    if (!server->characteristic_infos) {
+        ERROR("Error initializing HomeKit accessory server: "
+              "failed to allocate memory for characteristic infos");
+        return -1;
+    }
+
+    server->subscriptions = bitset_new(server->notify_count * HOMEKIT_MAX_CLIENTS);
+    if (!server->subscriptions) {
+        ERROR("Error initializing HomeKit accessory server: "
+              "failed to allocate memory for subscriptions");
+        return -1;
+    }
+
+    server->notifications = calloc(server->notify_count, sizeof(characteristic_notification_info_t));
+    if (!server->notifications) {
+        ERROR("Error initializing HomeKit accessory server: "
+              "failed to allocate memory for notifications info");
+        return -1;
+    }
+
+    server->has_notification = bitset_new(server->notify_count);
+    if (!server->has_notification) {
+        ERROR("Error initializing HomeKit accessory server: "
+              "failed to allocate memory for notifications flags");
+        return -1;
+    }
+
+    uint16_t aid = 1;
+    uint16_t service_idx = 0;
+    uint16_t characteristic_idx = 0;
+    uint16_t notification_idx = 0;
+    for (uint16_t accessory_idx=0; accessory_idx < server->accessory_count; accessory_idx++) {
+        homekit_accessory_t *accessory = server->config->accessories[accessory_idx];
+
+        server->accessory_infos[accessory_idx].accessory = accessory;
+        if (accessory->id) {
+            server->accessory_infos[accessory_idx].aid = accessory->id;
+            if (accessory->id >= aid)
+                aid = accessory->id+1;
+        } else {
+            server->accessory_infos[accessory_idx].aid = aid++;
+        }
+
+        int iid = 1;
+        for (homekit_service_t **service_it = accessory->services; *service_it; service_it++, service_idx++) {
+            homekit_service_t *service = *service_it;
+
+            server->service_infos[service_idx].service = service;
+            if (service->id) {
+                if (service->id >= iid)
+                    iid = service->id+1;
+            } else {
+                server->service_infos[service_idx].iid = iid++;
+            }
+
+            for (homekit_characteristic_t **ch_it = service->characteristics; *ch_it; ch_it++, characteristic_idx++) {
+                homekit_characteristic_t *ch = *ch_it;
+
+                server->characteristic_infos[characteristic_idx].ch = ch;
+                server->characteristic_infos[characteristic_idx].aid = server->accessory_infos[accessory_idx].aid;
+                if (ch->id) {
+                    if (ch->id >= iid)
+                        iid = ch->id+1;
+                } else {
+                    server->characteristic_infos[characteristic_idx].iid = iid++;
+                }
+
+                if (ch->permissions & homekit_permissions_notify) {
+                    server->characteristic_infos[characteristic_idx].notification_id = notification_idx;
+                    server->notifications[notification_idx].ch = ch;
+                    notification_idx++;
+                }
+            }
+        }
+    }
+
+    qsort(server->accessory_infos,
+          server->accessory_count,
+          sizeof(*server->accessory_infos),
+          (int(*)(const void*, const void*))accessory_info_cmp_accessory);
+
+    qsort(server->service_infos,
+          server->service_count,
+          sizeof(*server->service_infos),
+          (int(*)(const void*, const void*))service_info_cmp_service);
+
+    qsort(server->characteristic_infos,
+          server->characteristic_count,
+          sizeof(*server->characteristic_infos),
+          (int(*)(const void*, const void*))characteristic_info_cmp_characteristic);
+
+    return 0;
+}
+
+
 void homekit_server_init(homekit_server_config_t *config) {
     if (!config->accessories) {
         ERROR("Error initializing HomeKit accessory server: "
@@ -3492,8 +4323,6 @@ void homekit_server_init(homekit_server_config_t *config) {
         }
     }
 
-    homekit_accessories_init(config->accessories);
-
     if (!config->config_number) {
         config->config_number = config->accessories[0]->config_number;
         if (!config->config_number) {
@@ -3505,8 +4334,19 @@ void homekit_server_init(homekit_server_config_t *config) {
         config->category = config->accessories[0]->category;
     }
 
-    homekit_server_t *server = server_new();
+    server = server_new();
+    if (!server) {
+        ERROR("Error initializing HomeKit accessory server: "
+              "failed to allocate memory for server");
+        return;
+    }
     server->config = config;
+
+    if (homekit_accessories_init(server)) {
+        server_free(server);
+        server = NULL;
+        return;
+    }
 
     if (pdPASS != xTaskCreate(homekit_server_task, "HomeKit Server",
                               SERVER_TASK_STACK, server, 1, NULL)) {
@@ -3557,11 +4397,11 @@ int homekit_get_setup_uri(const homekit_server_config_t *config, char *buffer, s
 
     if (!config->password)
         return -1;
-    // TODO: validate password in case it is run beffore server is started
+    // TODO: validate password in case it is run before server is started
 
     if (!config->setupId)
         return -1;
-    // TODO: validate setupID in case it is run beffore server is started
+    // TODO: validate setupID in case it is run before server is started
 
     homekit_accessory_t *accessory = homekit_accessory_by_id(config->accessories, 1);
     if (!accessory)

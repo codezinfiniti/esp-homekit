@@ -2,10 +2,14 @@
 #include <string.h>
 
 #include <homekit/tlv.h>
+#include "tlv_internal.h"
 
 
 tlv_values_t *tlv_new() {
     tlv_values_t *values = malloc(sizeof(tlv_values_t));
+    if (!values)
+        return NULL;
+
     values->head = NULL;
     return values;
 }
@@ -26,6 +30,9 @@ void tlv_free(tlv_values_t *values) {
 
 int tlv_add_value_(tlv_values_t *values, byte type, byte *value, size_t size) {
     tlv_t *tlv = malloc(sizeof(tlv_t));
+    if (!tlv) {
+        return TLV_ERROR_MEMORY;
+    }
     tlv->type = type;
     tlv->size = size;
     tlv->value = value;
@@ -48,6 +55,9 @@ int tlv_add_value(tlv_values_t *values, byte type, const byte *value, size_t siz
     byte *data = NULL;
     if (size) {
         data = malloc(size);
+        if (!data) {
+            return TLV_ERROR_MEMORY;
+        }
         memcpy(data, value, size);
     }
     return tlv_add_value_(values, type, data, size);
@@ -72,6 +82,8 @@ int tlv_add_tlv_value(tlv_values_t *values, byte type, tlv_values_t *value) {
     size_t tlv_size = 0;
     tlv_format(value, NULL, &tlv_size);
     byte *tlv_data = malloc(tlv_size);
+    if (!tlv_data)
+        return TLV_ERROR_MEMORY;
     int r = tlv_format(value, tlv_data, &tlv_size);
     if (r) {
         free(tlv_data);
@@ -146,7 +158,7 @@ int tlv_format(const tlv_values_t *values, byte *buffer, size_t *size) {
 
     if (*size < required_size) {
         *size = required_size;
-        return -1;
+        return TLV_ERROR_INSUFFICIENT_SIZE;
     }
 
     *size = required_size;
@@ -203,6 +215,9 @@ int tlv_parse(const byte *buffer, size_t length, tlv_values_t *values) {
         // allocate memory to hold all pieces of chunked data and copy data there
         if (size != 0) {
             data = malloc(size);
+            if (!data)
+                return TLV_ERROR_MEMORY;
+
             byte *p = data;
 
             size_t remaining = size;
@@ -219,4 +234,131 @@ int tlv_parse(const byte *buffer, size_t length, tlv_values_t *values) {
     }
 
     return 0;
+}
+
+
+int tlv_stream_init(tlv_stream_t *tlv, uint8_t *buffer, size_t size, tlv_flush_callback on_flush, void *context) {
+    tlv->buffer = buffer;
+    tlv->size = size;
+    tlv->pos = 0;
+    tlv->on_flush = on_flush;
+    tlv->context = context;
+
+    return 0;
+}
+
+
+tlv_stream_t *tlv_stream_new(size_t size, tlv_flush_callback on_flush, void *context) {
+    tlv_stream_t *tlv = malloc(sizeof(tlv_stream_t) + size);
+    if (!tlv)
+        return NULL;
+
+    if (tlv_stream_init(tlv, ((uint8_t*)tlv) + sizeof(tlv_stream_t), size, on_flush, context)) {
+        free(tlv);
+        return NULL;
+    }
+
+    return tlv;
+}
+
+
+void tlv_stream_free(tlv_stream_t *tlv) {
+    free(tlv);
+}
+
+
+void tlv_stream_set_context(tlv_stream_t *tlv, void *context) {
+    tlv->context = context;
+}
+
+
+void tlv_stream_flush(tlv_stream_t *tlv) {
+    if (!tlv->pos)
+        return;
+
+    if (tlv->on_flush)
+        tlv->on_flush(tlv->buffer, tlv->pos, tlv->context);
+
+    tlv->pos = 0;
+}
+
+
+void tlv_stream_reset(tlv_stream_t *tlv) {
+    tlv->pos = 0;
+}
+
+
+void tlv_stream_put(tlv_stream_t *tlv, uint8_t b) {
+    tlv->buffer[tlv->pos++] = b;
+    if (tlv->pos >= tlv->size - 1)
+        tlv_stream_flush(tlv);
+}
+
+
+int tlv_stream_add_value(tlv_stream_t *tlv, uint8_t type, const uint8_t *data, size_t size) {
+    if (!size) {
+        tlv_stream_put(tlv, type);
+        tlv_stream_put(tlv, 0);
+        return 0;
+    }
+
+    while (size) {
+        uint8_t chunk_size = (size > 255) ? 255 : size;
+
+        tlv_stream_put(tlv, type);
+        tlv_stream_put(tlv, chunk_size);
+
+        uint8_t _chunk_size = chunk_size;
+        while (_chunk_size) {
+            size_t _size = _chunk_size;
+            if (_chunk_size > tlv->size - tlv->pos)
+                _size = tlv->size - tlv->pos;
+
+            memcpy(&tlv->buffer[tlv->pos], data, _size);
+            _chunk_size -= _size;
+            data += _size;
+            tlv->pos += _size;
+
+            if (tlv->pos >= tlv->size) {
+                tlv_stream_flush(tlv);
+            }
+        }
+
+        size -= chunk_size;
+    }
+
+    return 0;
+}
+
+int tlv_stream_add_string_value(tlv_stream_t *tlv, uint8_t type, const char *value) {
+    return tlv_stream_add_value(tlv, type, (const uint8_t *)value, strlen(value));
+}
+
+int tlv_stream_add_integer_value(tlv_stream_t *tlv, uint8_t type, size_t size, int value) {
+    uint8_t data[8];
+
+    for (size_t i=0; i<size; i++) {
+        data[i] = value & 0xff;
+        value >>= 8;
+    }
+
+    return tlv_stream_add_value(tlv, type, data, size);
+}
+
+int tlv_stream_add_tlv_value(tlv_stream_t *tlv, uint8_t type, tlv_values_t *value) {
+    size_t tlv_size = 0;
+    tlv_format(value, NULL, &tlv_size);
+    uint8_t *tlv_data = malloc(tlv_size);
+    if (!tlv_data)
+        return TLV_ERROR_MEMORY;
+    int r = tlv_format(value, tlv_data, &tlv_size);
+    if (r) {
+        free(tlv_data);
+        return r;
+    }
+
+    r = tlv_stream_add_value(tlv, type, tlv_data, tlv_size);
+    free(tlv_data);
+
+    return r;
 }
