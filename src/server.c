@@ -886,6 +886,64 @@ void write_characteristic_json(json_stream *json, client_context_t *client, cons
 }
 
 
+int client_send_plainv(
+    client_context_t *context,
+    uint8_t n, const byte **part_data, size_t *part_sizes
+) {
+    if (!context)
+        return -1;
+
+    /*
+    // 5 parts should be enough to send everything at one go in all existing
+    // cases, but just in case implementing chunked sending
+    struct iovec parts[5];
+    for (uint8_t i=0; i < n; i++) {
+        uint8_t _n = n - i;
+        if (_n > countof(parts))
+            _n = countof(parts);
+
+        for (uint8_t j=0; j < _n; i++, j++) {
+            parts[j].iov_base = (void *)data[i];
+            parts[j].iov_len = data_sizes[i];
+        }
+
+        lwip_writev(context->socket, parts, _n);
+    }
+    */
+    byte buffer[1024];
+
+    uint8_t part_index = 0;
+    size_t part_offset = 0;
+
+    while (part_index < n) {
+        size_t chunk_size = 0;
+        while (part_index < n && chunk_size < sizeof(buffer)) {
+            size_t extra_size = part_sizes[part_index] - part_offset;
+            if (chunk_size + extra_size > sizeof(buffer)) {
+                extra_size = sizeof(buffer) - chunk_size;
+            }
+
+            memcpy(buffer+chunk_size, part_data[part_index]+part_offset, extra_size);
+
+            chunk_size += extra_size;
+            part_offset += extra_size;
+            if (part_offset >= part_sizes[part_index]) {
+                part_index++;
+                part_offset = 0;
+            }
+        }
+
+        int r = write(context->socket, buffer, chunk_size);
+        if (r == -1) {
+            CLIENT_ERROR(context, "Failed to write response (errno %d)", errno);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+
 int client_send_encryptedv(
     client_context_t *context,
     uint8_t n, const byte **part_data, size_t *part_sizes
@@ -938,11 +996,15 @@ int client_send_encryptedv(
             encrypted+2, &available
         );
         if (r) {
-            ERROR("Failed to chacha encrypt payload (code %d)", r);
+            CLIENT_ERROR(context, "Failed to chacha encrypt payload (code %d)", r);
             return -1;
         }
 
-        write(context->socket, encrypted, available + 2);
+        r = write(context->socket, encrypted, available + 2);
+        if (r == -1) {
+            CLIENT_ERROR(context, "Failed to write response (errno %d)", errno);
+            return -1;
+        }
     }
 
     return 0;
@@ -1018,34 +1080,29 @@ void client_sendv(client_context_t *context, uint8_t n, const byte **data, size_
         data_size += data_sizes[i];
 
     if (data_size < 4096) {
-        char *payload = binary_to_stringv(n, data, data_sizes);
+        char *payload = data_to_stringv(n, data, data_sizes);
         if (payload) {
             CLIENT_DEBUG(context, "Sending payload: %s", payload);
             free(payload);
         } else {
             CLIENT_DEBUG(context, "Sending payload of size %d", data_size);
         }
+    } else {
+        CLIENT_DEBUG(context, "Sending payload of size %d", data_size);
     }
 #endif
 
     if (context->encrypted) {
-        int r = client_send_encryptedv(context, n, data, data_sizes);
-        if (r) {
-            CLIENT_ERROR(context, "Failed to encrypt response (code %d)", r);
-            return;
-        }
+        client_send_encryptedv(context, n, data, data_sizes);
     } else {
-        // 5 parts should be enough to send everything at one go in all existing
-        // cases, but just in case implementing chunked sending
-        struct iovec parts[5];
-        for (uint8_t i=0; i < n;) {
-            uint8_t _n = (n - i > 4) ? 4 : n - i;
-            for (uint8_t j=0; j < _n; i++, j++) {
-                parts[j].iov_base = (void *)data[i];
-                parts[j].iov_len = data_sizes[i];
+        if (n == 1) {
+            int r = write(context->socket, data[0], data_sizes[0]);
+            if (r < 0) {
+                CLIENT_ERROR(context, "Failed to send response (errno %d)", errno);
+                return;
             }
-
-            lwip_writev(context->socket, parts, _n);
+        } else {
+            client_send_plainv(context, n, data, data_sizes);
         }
     }
 }
